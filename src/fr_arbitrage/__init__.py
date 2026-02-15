@@ -1,1 +1,1 @@
-"""FR-Arbitrage: Delta-neutral funding rate arbitrage bot."""
+"""Hyperliquid Yield Harvester — Delta-neutral FR arbitrage bot."""

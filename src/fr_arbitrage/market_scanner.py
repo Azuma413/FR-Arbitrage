@@ -1,173 +1,111 @@
-"""MarketScanner — Scans exchange for high-FR arbitrage opportunities.
+"""Opportunity Scanner — Filters market data for profitable entry targets.
 
-Implements README §4.1 (Entry Criteria):
-  - Quote currency: USDT
-  - Funding Rate  ≥ threshold (default 0.03% / 8h)
-  - 24h Volume    ≥ threshold (default 10M USDT)
-  - Spread (Perp − Spot) / Spot ≥ threshold (default 0.2%) and positive
+Corresponds to README §3.2:
+  - Reads from MarketState dict (no direct API calls)
+  - Filters by funding rate, open interest, and spread
+  - Returns list[TargetSymbol] for coins not already held
 """
 
 from __future__ import annotations
 
-import asyncio
-from typing import Any
+from typing import Dict, Set
 
-import ccxt.async_support as ccxt
-import pandas as pd
-from loguru import logger
+import structlog
 
 from fr_arbitrage.config import Settings
-from fr_arbitrage.models import TargetSymbol
+from fr_arbitrage.models import MarketState, TargetSymbol
+
+logger = structlog.get_logger()
 
 
-class MarketScanner:
-    """Fetches market data and filters for profitable FR-arbitrage targets."""
+class OpportunityScanner:
+    """Scans MarketState for coins meeting entry criteria."""
 
     def __init__(
-        self, settings: Settings, *, exchange: Any | None = None
+        self,
+        settings: Settings,
+        states: Dict[str, MarketState],
     ) -> None:
         self._settings = settings
-        self._exchange = exchange
-        self._owns_exchange = exchange is None  # True = we created it
+        self._states = states
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    def scan(self, held_symbols: Set[str]) -> list[TargetSymbol]:
+        """Evaluate all tracked coins and return those passing filters.
 
-    async def start(self) -> None:
-        """Initialise the exchange connection (skipped if injected via DI)."""
-        if self._exchange is not None:
-            logger.info("MarketScanner using injected exchange")
-            return
-
-        exchange_cls = getattr(ccxt, self._settings.exchange_name)
-        self._exchange = exchange_cls(
-            {
-                "apiKey": self._settings.api_key,
-                "secret": self._settings.api_secret,
-                "enableRateLimit": True,
-                "options": {"defaultType": "swap"},  # perpetual futures
-            }
-        )
-        await self._exchange.load_markets()
-        logger.info(
-            "MarketScanner connected to {} — {} markets loaded",
-            self._settings.exchange_name,
-            len(self._exchange.markets),
-        )
-
-    async def close(self) -> None:
-        """Close the exchange connection gracefully (skipped if injected)."""
-        if self._exchange is not None and self._owns_exchange:
-            await self._exchange.close()
-            logger.info("MarketScanner exchange connection closed")
-
-    # ------------------------------------------------------------------
-    # Core scan logic
-    # ------------------------------------------------------------------
-
-    async def scan(self) -> list[TargetSymbol]:
-        """Scan all USDT-perp markets and return filtered targets sorted by FR descending.
+        Parameters
+        ----------
+        held_symbols:
+            Set of coin names already held (skip these).
 
         Returns
         -------
         list[TargetSymbol]
-            Markets passing all filter criteria, sorted by ``funding_rate`` descending.
+            Coins passing all criteria, sorted by funding_rate descending.
         """
-        assert self._exchange is not None, "Call start() before scan()"
+        targets: list[TargetSymbol] = []
 
-        # 1. Collect funding rates for all linear USDT perpetuals
-        funding_rates = await self._fetch_funding_rates()
-        if not funding_rates:
-            logger.warning("No funding rate data retrieved")
-            return []
-
-        # 2. Fetch tickers for spot + perp prices and volume
-        tickers = await self._exchange.fetch_tickers()
-
-        # 3. Build rows
-        rows: list[dict[str, Any]] = []
-        for symbol, fr in funding_rates.items():
-            spot_symbol = self._to_spot_symbol(symbol)
-            perp_ticker = tickers.get(symbol)
-            spot_ticker = tickers.get(spot_symbol)
-            if perp_ticker is None or spot_ticker is None:
+        for coin, state in self._states.items():
+            # Skip already held
+            if coin in held_symbols:
                 continue
 
-            spot_price = spot_ticker.get("last")
-            perp_price = perp_ticker.get("last")
-            volume_24h = perp_ticker.get("quoteVolume")  # USDT volume
-
-            if not all([spot_price, perp_price, volume_24h]):
+            # Skip blacklisted
+            if coin in self._settings.blacklist_coins:
                 continue
 
-            spread_pct = (perp_price - spot_price) / spot_price
+            # Skip if no price data yet
+            if state.best_bid <= 0 or state.spot_best_ask <= 0:
+                continue
 
-            rows.append(
-                {
-                    "symbol": symbol,
-                    "funding_rate": fr,
-                    "spot_price": spot_price,
-                    "perp_price": perp_price,
-                    "spread_pct": spread_pct,
-                    "volume_24h": volume_24h,
-                }
+            # --- Filter 1: Funding Rate (must be positive) ---
+            if state.funding_rate < self._settings.min_funding_rate_hourly:
+                continue
+
+            # --- Filter 2: Open Interest > threshold ---
+            if state.open_interest < self._settings.min_daily_volume:
+                continue
+
+            # --- Filter 3: Spread check ---
+            # (Spot Ask - Perp Bid) / Spot Ask should be less than
+            # estimated 24h funding income
+            spread = state.perp_spot_spread
+            estimated_24h_funding = state.funding_rate * 24  # hourly → daily
+            if spread >= estimated_24h_funding:
+                logger.debug(
+                    "spread_too_wide",
+                    coin=coin,
+                    spread=f"{spread:.4%}",
+                    funding_24h=f"{estimated_24h_funding:.4%}",
+                )
+                continue
+
+            # Also check max spread limit
+            if spread > self._settings.max_entry_spread:
+                continue
+
+            targets.append(
+                TargetSymbol(
+                    coin=coin,
+                    funding_rate=state.funding_rate,
+                    spot_ask=state.spot_best_ask,
+                    perp_bid=state.best_bid,
+                    spread=spread,
+                    open_interest=state.open_interest,
+                )
             )
 
-        if not rows:
-            logger.info("No pairs with valid price data")
-            return []
+        # Sort by funding rate descending (best opportunities first)
+        targets.sort(key=lambda t: t.funding_rate, reverse=True)
 
-        # 4. Filter using config thresholds
-        df = pd.DataFrame(rows)
-        filtered = df[
-            (df["funding_rate"] >= self._settings.min_funding_rate)
-            & (df["volume_24h"] >= self._settings.min_volume_24h)
-            & (df["spread_pct"] >= self._settings.min_spread_pct)
-        ]
-        filtered = filtered.sort_values("funding_rate", ascending=False)
-
-        targets = [TargetSymbol(**row) for row in filtered.to_dict(orient="records")]
-
-        logger.info(
-            "Scan complete: {}/{} pairs passed filters",
-            len(targets),
-            len(rows),
-        )
-        for t in targets[:5]:
-            logger.debug(
-                "  {} FR={:.4%} Spread={:.4%} Vol={:,.0f}",
-                t.symbol,
-                t.funding_rate,
-                t.spread_pct,
-                t.volume_24h,
+        if targets:
+            logger.info(
+                "scan_complete",
+                total_coins=len(self._states),
+                targets_found=len(targets),
+                top_coin=targets[0].coin if targets else None,
+                top_fr=f"{targets[0].funding_rate:.6%}" if targets else None,
             )
+        else:
+            logger.debug("scan_complete", targets_found=0)
 
         return targets
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    async def _fetch_funding_rates(self) -> dict[str, float]:
-        """Retrieve the latest predicted funding rate for every USDT-perp market.
-
-        Returns a ``{symbol: rate}`` mapping.
-        """
-        assert self._exchange is not None
-
-        # ccxt unified: fetch_funding_rates() returns {symbol: {info, rate, ...}}
-        raw: dict[str, Any] = await self._exchange.fetch_funding_rates()
-        rates: dict[str, float] = {}
-        for symbol, data in raw.items():
-            if not symbol.endswith("/USDT:USDT"):
-                continue
-            rate = data.get("fundingRate")
-            if rate is not None:
-                rates[symbol] = float(rate)
-        return rates
-
-    @staticmethod
-    def _to_spot_symbol(perp_symbol: str) -> str:
-        """Convert a perpetual symbol like ``BTC/USDT:USDT`` to spot ``BTC/USDT``."""
-        return perp_symbol.replace(":USDT", "")

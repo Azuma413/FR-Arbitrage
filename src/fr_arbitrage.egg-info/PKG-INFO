@@ -1,182 +1,211 @@
 Metadata-Version: 2.4
 Name: fr-arbitrage
-Version: 0.1.0
-Summary: Delta-neutral FR arbitrage bot for high-volatility altcoins
+Version: 0.2.0
+Summary: Hyperliquid Yield Harvester — Delta-neutral FR arbitrage bot
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
-Requires-Dist: ccxt>=4.0
-Requires-Dist: pandas>=2.0
+Requires-Dist: hyperliquid-python-sdk>=0.9
+Requires-Dist: aiohttp>=3.9
 Requires-Dist: pydantic>=2.0
 Requires-Dist: pydantic-settings>=2.0
-Requires-Dist: loguru>=0.7
-Requires-Dist: python-dotenv>=1.0
+Requires-Dist: structlog>=24.0
+Requires-Dist: sqlalchemy>=2.0
+Requires-Dist: aiosqlite>=0.19
 
-# プロジェクト仕様書: DeltaNeutral-YieldHarvester (High-Vol Edition)
+# プロジェクト仕様書（最終版）: Hyperliquid Yield Harvester
 
 ## 1. プロジェクト概要
 
-本システムは、暗号資産取引所（主対象: Bybit/Binance）において、現物（Spot）と無期限先物（Perpetual）のポジションを同量保有することでデルタニュートラル状態を維持し、高ボラティリティなアルトコインから発生する高額なFunding Rate（資金調達率）を自動で獲得するシステムである。
+Hyperliquid上のSpot（現物）とPerpetual（無期限先物）の間で、同一銘柄のデルタニュートラル・ポジションを構築し、Funding Rate（資金調達率）を半永久的に受け取り続ける「Cash & Carry（Basis Trading）」自動売買システム。
 
-* **目標:** 月利 2.0% 〜 5.0%（年利換算 24% 〜 60%）の安定運用
-* **コア戦略:** 金利差アービトラージ（Cash & Carry Trade）
-* **主要な敵:** 執行スリッページ、APIレート制限、片側約定（Leg risk）、急激な相場変動によるロスカット
+### コアコンセプト
+
+* **戦略:** Spot買い + Perp売り（1:1ヘッジ）
+* **収益源:** Perp市場のロング需要過多により発生するPositive Funding Rate。
+* **主要件:** 低レイテンシ、原子性（Atomicity）の担保、厳格な資金管理。
 
 ## 2. 技術スタック & 環境
 
-* **言語:** Python 3.10+
-* **主要ライブラリ:**
-* `ccxt` (Async必須): 取引所API操作
-* `asyncio`: 非同期処理
-* `pandas`: データフレーム操作（計算用）
-* `pydantic`: データモデル定義・バリデーション
-* `loguru`: ロギング
-* `python-dotenv`: 環境変数管理
+* **言語:** Python 3.10+ (Type Hinting, asyncio必須)
+* **コアライブラリ:**
+* `hyperliquid-python-sdk`: 公式SDK（署名・発注処理の中核）。
+* `aiohttp`: REST APIの非同期リクエスト。
+* `websockets`: Market Data（L2 Book, Trades）のリアルタイム受信。
+* `sqlalchemy` + `aiosqlite`: 非同期DB処理による状態管理。
+* `pydantic`: 環境変数・設定ファイルの型安全な管理。
+* `structlog`: 構造化ログ（JSON形式）による可観測性の向上。
 
 
-* **DB/ストレージ:** `SQLite` (軽量な状態管理用) + `JSON` (設定ファイル)
-* **環境:** Docker (推奨) または Systemd (Linux Deamon)
+* **インフラ:**
+* Docker Compose（Bot + SQLite volume）。
+* VPS: AWS Tokyo/Singapore または Vultr Tokyo（Hyperliquidのエンドポイントに近いリージョン）。
+
+
 
 ## 3. システムアーキテクチャ
 
-システムは以下の4つの独立した非同期モジュールで構成される。
+システムは `asyncio.gather` により並行稼働する4つの独立したサービスで構成される。
 
-1. **MarketScanner (市場監視)**: 全ペアのFR、出来高、スプレッドを監視。
-2. **OrderManager (注文執行)**: デルタニュートラルを維持したAtomicな売買執行。
-3. **PositionGuardian (ポジション管理)**: 証拠金維持率の監視とリバランス。
-4. **HealthMonitor (死活監視)**: エラーハンドリングと緊急停止。
+### 3.1. Market Data Streamer (Websocket)
 
----
+* **役割:** 購読銘柄の最新価格（Best Bid/Ask）、Funding Rate、Open Interestをメモリ内の `MarketState` オブジェクトに常時反映する。
+* **最適化:** REST APIポーリングは行わず、Websocketのみで価格を更新し、判断のレイテンシを最小化する。
+
+### 3.2. Opportunity Scanner (Entry Logic)
+
+* **スクリーニング基準:**
+1. **Funding Rate:** 過去X時間の平均がプラス、かつ現在の予測値もプラスであること。
+2. **Liquidity (OI):** Open Interest が $1M 以上（流動性枯渇によるスリッページ防止）。
+3. **Spread Check:** `(Spot Ask - Perp Bid) / Spot Ask` が、24時間分のFunding収入を下回っていること（コスト回収期間の短縮）。
+
+
+* **アクション:** 条件を満たし、かつポジションを持っていない銘柄があれば Execution Engine へシグナルを送る。
+
+### 3.3. Execution Engine (Order Manager)
+
+* **原子性（Atomicity）の模倣:** ブロックチェーン上のトランザクションではないため、完全なアトミック性は保証されない。以下のフローで擬似的に実現する。
+1. **Spot Entry:** 指値（IOC: Immediate Or Cancel）で `Best Ask * (1 + Slippage Tolerance)` の価格で発注。
+2. **Verify Spot:** 約定した数量 `executed_sz` を確認。0なら終了。
+3. **Perp Entry:** Spotと同量を、指値（IOC）で `Best Bid * (1 - Slippage Tolerance)` の価格でショート発注。
+4. **Error Handling (Rollback):**
+* Perpが約定しなかった、または部分約定だった場合、**「Spotの過剰分」を即座に成行（またはAggressive Limit）で売却**し、デルタを0に戻す。
+* *修正点:* 完全にポジションを閉じるのではなく、Perpの約定量に合わせてSpotを減らす「Netting」処理を優先し、無駄な手数料支払いを防ぐ。
+
+
+
+
+
+### 3.4. Position Guardian (Risk & Rebalance)
+
+* **役割:** 既存ポジションの監視とメンテナンス。
+* **Exit条件（撤退）:**
+* Funding Rateが一定期間（例: 3回連続）マイナスになった場合。
+* Spreadが縮小し、利益確定のチャンス（Backwardation）が発生した場合。
+
+
+* **Auto-Deleverage (Rebalance):**
+* 価格上昇によりPerp側の含み損が拡大し、有効証拠金（USDC）が圧迫された場合、Spotを一部売却してUSDCに戻し、Perpの証拠金に充当する。
+* **トリガー:** `Margin Usage > 80%` (または Leverage > 3x 等)。
+
+
 
 ## 4. 詳細ロジック仕様
 
-### 4.1. MarketScanner (Entry Criteria)
+### 4.1. メタデータ管理（重要）
 
-以下の条件を全て満たす銘柄を「ターゲット」として選定する。
+Hyperliquidは銘柄ごとに小数点以下の桁数（Decimals）が厳密に決まっている。
 
-* **スキャン頻度:** 1分に1回
-* **フィルタリング条件:**
-1. **Quote Currency:** USDT (例: `XXX/USDT`)
-2. **Funding Rate:** 直近のFunding Rate予測値が `0.03%` (8時間) 以上（年利換算 約32%以上）であること。
-* *※高ボラティリティ狙いのため閾値を高めに設定*
+* **Size Decimals (`sz_decimals`):** 発注数量の丸めに使用。
+* **Price Decimals (`px_decimals`):** 指値価格の丸めに使用。
+* **実装:** 起動時に `info.meta()` を一度だけ取得し、辞書形式で保持。発注関数内で必ず `round()` 処理を挟むラッパーを作成する。
 
+### 4.2. 資金管理ロジック
 
-3. **Liquidity (Volume):** 24時間出来高が `10,000,000 USDT` 以上であること（流動性枯渇リスク回避）。
-4. **Spread:** 現物と先物の価格差（Premium）が `0.2%` 以上、かつ正の乖離（先物 > 現物）であること。
-* *これにより、エントリー瞬間の含み損（スプレッド負け）を最小化する。*
+Hyperliquidの仕様上、**Spot資産はPerpの証拠金（Cross Margin）としてカウントされない**（USDCのみが担保）。
 
-
-
-
-
-### 4.2. OrderManager (Execution Logic)
-
-**最重要コンポーネント。** 片側約定（Leg Risk）を防ぐため、以下の手順で執行する。
-
-* **執行アルゴリズム:** "Concurrent Taker" (同時成行)
-* 指値（Maker）は片側約定リスクが高いため、開発初期は成行（Taker）で同期させることを優先する。手数料負けは高FRで回収する設計。
+* **初期配分 (例: 10,000 USDC):**
+* Spot Allocation: 45% (4,500 USDC)
+* Perp Collateral: 55% (5,500 USDC)
+* *理由:* Perp側はFundingの支払いが（稀に）発生したり、価格上昇時の含み損に耐えるため、Spotより多くのUSDCを残す必要がある。
 
 
-* **プロセス:**
-1. `min_trade_amount`（最小取引単位）と`step_size`（刻み値）をAPIから取得。
-2. 投資予定額（例: 1000 USDT）から数量を算出。
-3. **[Async Task]** 現物買い注文（Market Buy）を発行。
-4. **[Async Task]** 先物売り注文（Market Short）を発行。
-5. `asyncio.gather` で両方の約定を待機。
-6. **Error Handling (Leg Recovery):**
-* もし片方だけ約定した場合（例：現物は買えたが、先物がエラーで弾かれた）、即座に約定した方を反対売買（Market Sell/Cover）してポジションを解消する。**絶対にポジションを放置しない。**
-
-
-
-
-
-### 4.3. PositionGuardian (Rebalancing & Exit)
-
-高ボラティリティアルトコインは短時間で50%以上動くことがあるため、証拠金管理が生命線となる。
-
-* **監視頻度:** 10秒に1回
-* **リバランス・ロジック (Rebalancing):**
-* 先物口座の証拠金維持率（Margin Level）を監視。
-* 条件: `Margin Level < 20%` (あるいは取引所の危険水域) に達した場合。
-* アクション:
-1. 現物口座（Spot Wallet）から先物口座（Futures Wallet）へ USDT を自動振替（Transfer）。
-2. 現物口座にUSDTが不足している場合、保有している現物ポジションの一部を売却し、同量の先物ショートを決済（ポジション縮小）して維持率を回復させる。
-
-
-
-
-* **エグジット・ロジック (Exit Criteria):**
-* **FR低下:** Funding Rateが `0.005%` 以下に低下、またはマイナス化した場合。
-* **緊急停止:** スプレッドがマイナス（逆乖離） `1.0%` 以上に拡大した場合。
+* **リバランス計算式:**
+* もし `Perp Unrealized Loss` が拡大し、`Available Margin` が危険水域に入ったら：
+* `Reduce Size = (Target Margin - Current Margin) / Current Price`
+* 上記数量分のSpotを売り、Perpを買い戻す（ポジション縮小）。
 
 
 
 ---
 
-## 5. データモデル設計 (Pydantic / SQLite)
+## 5. データモデル (Persistence)
 
-### 5.1. `TargetSymbol` (メモリ保持)
+再起動時やクラッシュ時にポジションを見失わないよう、ローカルDBを「正」とする。
+
+### 5.1. Database Schema (`positions` table)
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `symbol` | TEXT (PK) | 銘柄名 (例: HYPE, ETH) |
+| `spot_sz` | REAL | 保有現物数量 |
+| `perp_sz` | REAL | 保有ショート数量（負の値で管理するかフラグで管理するか統一） |
+| `entry_price` | REAL | ポジション構築時の加重平均価格 |
+| `accumulated_funding` | REAL | これまでに受け取ったFunding総額（集計用） |
+| `state` | TEXT | `OPEN`, `REBALANCING`, `CLOSING_PENDING` |
+| `updated_at` | DATETIME | 最終更新日時 |
+
+---
+
+## 6. コンフィグレーション (`config.py`)
+
+Pydanticを使用し、バリデーション付きの設定管理を行う。
 
 ```python
-class TargetSymbol(BaseModel):
-    symbol: str          # e.g., "DOGE/USDT"
-    funding_rate: float  # e.g., 0.0004 (0.04%)
-    spot_price: float
-    perp_price: float
-    spread_pct: float    # (perp - spot) / spot
-    volume_24h: float
+from pydantic_settings import BaseSettings
+from typing import List, Optional
 
-```
+class Settings(BaseSettings):
+    # --- Network & Auth ---
+    ENVIRONMENT: str = "MAINNET"  # or "TESTNET"
+    PRIVATE_KEY: str  # 0x...
+    account_address: str # wallet address derived from key
 
-### 5.2. `ActivePosition` (DB保存: `positions` テーブル)
+    # --- Strategy Parameters ---
+    TARGET_COINS: List[str] = ["HYPE", "PURR", "SOL", "ETH"] # 監視対象
+    BLACKLIST_COINS: List[str] = [] # 除外対象
+    
+    # Entry Filters
+    MIN_FUNDING_RATE_HOURLY: float = 0.00002  # 0.002% per hour
+    MAX_ENTRY_SPREAD: float = 0.001           # 0.1% spread limit
+    MIN_DAILY_VOLUME: float = 1_000_000       # $1M volume
 
-```python
-class ActivePosition(BaseModel):
-    id: str              # UUID
-    symbol: str
-    entry_timestamp: int
-    spot_qty: float      # 保有現物数量
-    perp_qty: float      # 保有ショート数量
-    entry_spread: float  # エントリー時の乖離率
-    total_fees: float    # 手数料合計（USDT）
-    status: str          # "OPEN", "CLOSING", "CLOSED"
+    # Execution Parameters
+    SLIPPAGE_TOLERANCE: float = 0.002         # 0.2%
+    MAX_RETRY_ATTEMPTS: int = 3
+    
+    # Position Sizing
+    MAX_POSITION_USDC: float = 1000.0         # 1銘柄あたりの最大投入額
+    LEVERAGE_BUFFER: float = 0.5              # Spot:Perp比率 (0.5 = 50:50配分からスタート)
+
+    # --- System ---
+    DB_URL: str = "sqlite+aiosqlite:///./yield_harvester.db"
+    LOG_LEVEL: str = "INFO"
+
+    class Config:
+        env_file = ".env"
 
 ```
 
 ---
 
-## 6. エラーハンドリング & 安全装置 (Kill Switch)
+## 7. バックテスト & 検証フェーズ
 
-本番稼働において最も重視すべき「守り」の仕様。
+### 7.1. HypeBacktester (Module)
 
-1. **API Rate Limit Management:**
-* `ccxt`のレートリミッター機能を有効化 (`enableRateLimit=True`)。
-* `429 Too Many Requests` が返ってきた場合、指数バックオフ（Exponential Backoff）で待機時間を増やして再試行。
-
-
-2. **Max Open Positions:**
-* 同時保有銘柄数は最大 `3` 銘柄に制限（資金分散とリスク管理のため）。
+* **データソース:** `/info` エンドポイントの `fundingHistory` および `candleSnapshot`。
+* **評価指標:**
+* **Net APR:** `Funding Income - (Entry Fee + Exit Fee + Slippage)`
+* **Max Drawdown:** 資金調達率がマイナス化した際の最大損失幅。
 
 
-3. **Global Kill Switch:**
-* プログラム起動時に `.env` ファイルまたは環境変数を読み込む。
-* `EMERGENCY_STOP=True` が検知された場合、新規エントリーを停止し、全てのポジションを成行でクローズしてプログラムを終了するモードを実装する。
+* **目的:** 過去のデータに基づき、「スプレッド負け」せずに利益が出るまでの最短保有期間を算出する。
+
+### 7.2. 運用ロードマップ
+
+1. **Phase 1: Testnet Validation**
+* Hyperliquid Testnetにて、`HYPE` などのテストトークンを用い、ロジック（特にEntry時のRollbackとRebalance）が正常に動作するか確認。
+* 意図的に片側の注文を失敗させ、リカバリー処理が走るかテストする。
 
 
+2. **Phase 2: Dry-Run (Mainnet)**
+* 本番APIに接続するが、発注リクエストのみをモック（Mock）化。
+* 「本来ならここでエントリーしていた」というログと、実際のスプレッド・板情報を照らし合わせ、条件が厳しすぎないか調整。
 
----
 
-## 7. 開発・実装ステップ（Antigravityへの指示用）
+3. **Phase 3: Production (Canary Release)**
+* 単一銘柄（例: HYPE）かつ少額（100 USDC）で稼働。
+* 1週間稼働させ、エラーログと実際のFunding受取額を確認。
 
-AIアシスタントに実装を依頼する際は、以下の順番でプロンプトを投げてください。
 
-**Phase 1: 接続テストとデータ取得**
-
-> `ccxt`を使ってBybit（またはBinance）に接続し、USDT無期限先物の全銘柄から「Funding Rate」「24h Volume」「現在価格」を取得して、FRが高い順にランキング表示するPythonスクリプトを作成してください。クラス設計は`MarketScanner`として分離してください。
-
-**Phase 2: 執行ロジックの実装（最重要）**
-
-> `OrderManager`クラスを作成してください。`asyncio`を使って、指定した銘柄のSpot買いとPerp売りを同時に成行で執行するメソッド `execute_entry(symbol, amount_usdt)` を実装してください。片側約定エラー時のロールバック処理（即時決済）も含めてください。
-
-**Phase 3: 監視とループ**
-
-> これらを統合し、常駐して市場を監視し、条件に合致したらエントリー、証拠金維持率が低下したら警告ログを出すメインループを作成してください。
+4. **Phase 4: Scale Out**
+* 監視対象を複数銘柄に拡大。複利運用（利益が出たらポジションを積み増す）ロジックの有効化。

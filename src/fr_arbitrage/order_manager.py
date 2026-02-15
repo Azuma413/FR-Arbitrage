@@ -1,363 +1,502 @@
-"""OrderManager — Concurrent Taker execution with leg-risk protection.
+"""Execution Engine — IOC limit order placement with Dry-Run support.
 
-Implements README §4.2 (Execution Logic):
-  - Spot Buy + Perp Short via asyncio.gather (Market orders)
-  - Automatic rollback on one-sided fill
-  - Position exit (close both legs)
+Corresponds to README §3.3:
+  - Spot Buy (IOC) → verify fill → Perp Short (IOC)
+  - Netting rollback on partial fills
+  - Dry-Run mode: simulate fills using real market data
+
+When ``DRY_RUN=True``, ``_place_order()`` returns a synthetic fill
+based on current best bid/ask + configured slippage. No real orders
+are sent. All downstream logic (position tracking, DB writes,
+guardian evaluation) operates identically.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+import time
+import uuid
+from typing import Any, Dict, Optional
 
-import ccxt.async_support as ccxt
-from loguru import logger
+import structlog
+from hyperliquid.exchange import Exchange
+from hyperliquid.info import Info
+from hyperliquid.utils import constants
 
 from fr_arbitrage.config import Settings
-from fr_arbitrage.models import ActivePosition, TargetSymbol
+from fr_arbitrage.database import upsert_position
+from fr_arbitrage.models import AssetMeta, MarketState, Position, TargetSymbol
+
+logger = structlog.get_logger()
 
 
 class OrderManager:
-    """Executes delta-neutral entry / exit orders with leg-risk safeguards."""
+    """Executes delta-neutral entry / exit orders with leg-risk safeguards.
+
+    In Dry-Run mode, simulates fills without sending real orders.
+    """
 
     def __init__(
         self,
         settings: Settings,
-        *,
-        spot_exchange: Any | None = None,
-        perp_exchange: Any | None = None,
+        states: Dict[str, MarketState],
+        asset_meta: Dict[str, AssetMeta],
     ) -> None:
         self._settings = settings
-        self._spot_exchange = spot_exchange
-        self._perp_exchange = perp_exchange
-        self._owns_exchange = spot_exchange is None  # True = we created them
+        self._states = states
+        self._asset_meta = asset_meta
+        self._exchange: Optional[Exchange] = None
+        self._info: Optional[Info] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Initialise exchange connections (skipped if injected via DI)."""
-        if self._spot_exchange is not None and self._perp_exchange is not None:
-            logger.info("OrderManager using injected exchanges")
-            return
-
-        exchange_cls = getattr(ccxt, self._settings.exchange_name)
-
-        common_params: dict[str, Any] = {
-            "apiKey": self._settings.api_key,
-            "secret": self._settings.api_secret,
-            "enableRateLimit": True,
-        }
-
-        # Spot connection
-        self._spot_exchange = exchange_cls(
-            {**common_params, "options": {"defaultType": "spot"}}
+        """Initialize Hyperliquid Exchange client."""
+        base_url = (
+            constants.MAINNET_API_URL
+            if self._settings.environment.upper() == "MAINNET"
+            else constants.TESTNET_API_URL
         )
-        await self._spot_exchange.load_markets()
 
-        # Perp (swap) connection
-        self._perp_exchange = exchange_cls(
-            {**common_params, "options": {"defaultType": "swap"}}
-        )
-        await self._perp_exchange.load_markets()
+        self._info = Info(base_url, skip_ws=True)
 
-        logger.info("OrderManager ready (spot + perp connections established)")
+        if not self._settings.dry_run:
+            # Real exchange connection
+            from eth_account import Account
+
+            wallet = Account.from_key(self._settings.private_key)
+            self._exchange = Exchange(
+                wallet,
+                base_url,
+                account_address=self._settings.account_address or None,
+            )
+            logger.info(
+                "order_manager_started",
+                mode="LIVE",
+                environment=self._settings.environment,
+            )
+        else:
+            logger.info(
+                "order_manager_started",
+                mode="DRY_RUN",
+                environment=self._settings.environment,
+            )
 
     async def close(self) -> None:
-        """Shutdown exchange connections (skipped if injected)."""
-        if self._owns_exchange:
-            for ex in (self._spot_exchange, self._perp_exchange):
-                if ex is not None:
-                    await ex.close()
-        logger.info("OrderManager connections closed")
+        """Cleanup (no persistent connections to close for Hyperliquid SDK)."""
+        logger.info("order_manager_closed")
 
     # ------------------------------------------------------------------
-    # Entry: Spot Buy + Perp Short (concurrent taker)
+    # Entry: Spot Buy + Perp Short
     # ------------------------------------------------------------------
 
     async def execute_entry(
-        self, target: TargetSymbol, amount_usdt: float
-    ) -> ActivePosition | None:
+        self, target: TargetSymbol, amount_usdc: float
+    ) -> Optional[Position]:
         """Open a delta-neutral position (Spot Buy + Perp Short).
 
         Parameters
         ----------
         target:
-            The scanned target symbol to trade.
-        amount_usdt:
-            USDT amount to invest in this position.
+            The scanned target coin to trade.
+        amount_usdc:
+            USDC amount to invest in this position.
 
         Returns
         -------
-        ActivePosition | None
+        Position | None
             The newly opened position, or ``None`` if execution failed.
         """
-        assert self._spot_exchange is not None
-        assert self._perp_exchange is not None
+        coin = target.coin
+        meta = self._asset_meta.get(coin)
+        if meta is None:
+            logger.error("no_asset_meta", coin=coin)
+            return None
 
-        spot_symbol = target.symbol.replace(":USDT", "")  # e.g. "DOGE/USDT"
-        perp_symbol = target.symbol                        # e.g. "DOGE/USDT:USDT"
+        state = self._states.get(coin)
+        if state is None or state.spot_best_ask <= 0:
+            logger.error("no_market_state", coin=coin)
+            return None
 
-        # 1. Determine quantity from market info
-        qty = self._calculate_quantity(
-            amount_usdt, target.spot_price, spot_symbol
-        )
-        if qty is None or qty <= 0:
-            logger.error("Could not calculate valid quantity for {}", spot_symbol)
+        # Calculate quantity
+        raw_qty = amount_usdc / state.spot_best_ask
+        qty = round(raw_qty, meta.sz_decimals)
+        if qty <= 0:
+            logger.error("qty_too_small", coin=coin, raw_qty=raw_qty)
             return None
 
         logger.info(
-            "Executing entry: {} | qty={} | ~{:.2f} USDT",
-            spot_symbol,
-            qty,
-            amount_usdt,
+            "executing_entry",
+            coin=coin,
+            qty=qty,
+            amount_usdc=amount_usdc,
+            spot_ask=state.spot_best_ask,
+            perp_bid=state.best_bid,
         )
 
-        # 2. Fire both legs concurrently
-        spot_task = asyncio.create_task(
-            self._place_order(self._spot_exchange, spot_symbol, "buy", qty),
-            name=f"spot_buy_{spot_symbol}",
+        # Step 1: Spot Buy (IOC)
+        spot_result = await self._place_spot_order(
+            coin, is_buy=True, sz=qty, meta=meta
         )
-        perp_task = asyncio.create_task(
-            self._place_order(self._perp_exchange, perp_symbol, "sell", qty),
-            name=f"perp_sell_{perp_symbol}",
+        if spot_result is None:
+            logger.error("spot_entry_failed", coin=coin)
+            return None
+
+        spot_filled = spot_result["filled_sz"]
+        spot_price = spot_result["avg_price"]
+
+        if spot_filled <= 0:
+            logger.warning("spot_zero_fill", coin=coin)
+            return None
+
+        # Step 2: Perp Short (IOC) for the filled spot quantity
+        perp_result = await self._place_perp_order(
+            coin, is_buy=False, sz=spot_filled, meta=meta
         )
 
-        results = await asyncio.gather(spot_task, perp_task, return_exceptions=True)
-        spot_result, perp_result = results
-
-        # 3. Handle leg-risk scenarios
-        spot_ok = not isinstance(spot_result, BaseException) and spot_result is not None
-        perp_ok = not isinstance(perp_result, BaseException) and perp_result is not None
-
-        if spot_ok and perp_ok:
-            # Both legs filled — success
-            spot_filled = float(spot_result.get("filled", qty))
-            perp_filled = float(perp_result.get("filled", qty))
-            total_fees = self._sum_fees(spot_result) + self._sum_fees(perp_result)
-
-            position = ActivePosition(
-                symbol=spot_symbol,
-                spot_qty=spot_filled,
-                perp_qty=perp_filled,
-                entry_spread=target.spread_pct,
-                total_fees=total_fees,
+        if perp_result is None or perp_result["filled_sz"] <= 0:
+            # ROLLBACK: sell spot to flatten
+            logger.error("perp_entry_failed_rollback", coin=coin)
+            await self._place_spot_order(
+                coin, is_buy=False, sz=spot_filled, meta=meta
             )
-            logger.success(
-                "Entry complete: {} spot={} perp={} fees={:.4f}",
-                spot_symbol,
-                spot_filled,
-                perp_filled,
-                total_fees,
-            )
-            return position
+            return None
 
-        # --- One-sided fill: ROLLBACK ---
-        if spot_ok and not perp_ok:
-            logger.error(
-                "LEG RISK — Perp order failed for {}. Rolling back spot buy.",
-                spot_symbol,
-            )
-            if isinstance(perp_result, BaseException):
-                logger.error("Perp error: {}", perp_result)
-            await self._rollback(self._spot_exchange, spot_symbol, "sell", qty)
+        perp_filled = perp_result["filled_sz"]
+        perp_price = perp_result["avg_price"]
 
-        elif perp_ok and not spot_ok:
-            logger.error(
-                "LEG RISK — Spot order failed for {}. Rolling back perp short.",
-                perp_symbol,
-            )
-            if isinstance(spot_result, BaseException):
-                logger.error("Spot error: {}", spot_result)
-            await self._rollback(self._perp_exchange, perp_symbol, "buy", qty)
+        # Step 3: Netting — if perp partially filled, reduce spot to match
+        if perp_filled < spot_filled:
+            excess = round(spot_filled - perp_filled, meta.sz_decimals)
+            if excess > 0:
+                logger.warning(
+                    "netting_excess_spot",
+                    coin=coin,
+                    excess=excess,
+                )
+                await self._place_spot_order(
+                    coin, is_buy=False, sz=excess, meta=meta
+                )
+            spot_filled = perp_filled
 
-        else:
-            logger.error("Both legs failed for {} — no rollback needed", spot_symbol)
-            for r in results:
-                if isinstance(r, BaseException):
-                    logger.error("  error: {}", r)
+        # Step 4: Persist position
+        entry_price = (spot_price + perp_price) / 2
+        position = Position(
+            symbol=coin,
+            spot_sz=spot_filled,
+            perp_sz=perp_filled,
+            entry_price=entry_price,
+            accumulated_funding=0.0,
+            state="OPEN",
+        )
+        await upsert_position(position)
 
-        return None
+        logger.info(
+            "entry_complete",
+            coin=coin,
+            spot_sz=spot_filled,
+            perp_sz=perp_filled,
+            entry_price=entry_price,
+            dry_run=self._settings.dry_run,
+        )
+        return position
 
     # ------------------------------------------------------------------
     # Exit: Close both legs
     # ------------------------------------------------------------------
 
-    async def execute_exit(self, position: ActivePosition) -> bool:
+    async def execute_exit(self, position: Position) -> bool:
         """Close the delta-neutral position (Spot Sell + Perp Cover).
 
-        Parameters
-        ----------
-        position:
-            The active position to close.
-
-        Returns
-        -------
-        bool
-            ``True`` if both legs closed successfully.
+        Returns True if both legs closed successfully.
         """
-        assert self._spot_exchange is not None
-        assert self._perp_exchange is not None
+        coin = position.symbol
+        meta = self._asset_meta.get(coin)
+        if meta is None:
+            logger.error("no_asset_meta_for_exit", coin=coin)
+            return False
 
-        spot_symbol = position.symbol
-        perp_symbol = f"{position.symbol}:USDT"
+        logger.info(
+            "executing_exit",
+            coin=coin,
+            spot_sz=position.spot_sz,
+            perp_sz=position.perp_sz,
+        )
 
-        logger.info("Executing exit: {}", spot_symbol)
-
+        # Close both legs concurrently
         spot_task = asyncio.create_task(
-            self._place_order(
-                self._spot_exchange, spot_symbol, "sell", position.spot_qty
+            self._place_spot_order(
+                coin, is_buy=False, sz=position.spot_sz, meta=meta
             )
         )
         perp_task = asyncio.create_task(
-            self._place_order(
-                self._perp_exchange,
-                perp_symbol,
-                "buy",
-                position.perp_qty,
-                params={"reduceOnly": True},
+            self._place_perp_order(
+                coin, is_buy=True, sz=position.perp_sz, meta=meta,
+                reduce_only=True,
             )
         )
 
         results = await asyncio.gather(spot_task, perp_task, return_exceptions=True)
         spot_result, perp_result = results
 
-        spot_ok = not isinstance(spot_result, BaseException) and spot_result is not None
-        perp_ok = not isinstance(perp_result, BaseException) and perp_result is not None
+        spot_ok = (
+            not isinstance(spot_result, BaseException)
+            and spot_result is not None
+            and spot_result.get("filled_sz", 0) > 0
+        )
+        perp_ok = (
+            not isinstance(perp_result, BaseException)
+            and perp_result is not None
+            and perp_result.get("filled_sz", 0) > 0
+        )
 
         if spot_ok and perp_ok:
-            logger.success("Exit complete: {}", spot_symbol)
-            position.status = "CLOSED"
+            position.state = "CLOSED"
+            await upsert_position(position)
+            logger.info("exit_complete", coin=coin)
             return True
 
         logger.error(
-            "Exit partially failed for {} — manual intervention may be required",
-            spot_symbol,
+            "exit_partially_failed",
+            coin=coin,
+            spot_ok=spot_ok,
+            perp_ok=perp_ok,
         )
-        for r in results:
-            if isinstance(r, BaseException):
-                logger.error("  error: {}", r)
         return False
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Internal order placement
     # ------------------------------------------------------------------
 
-    def _calculate_quantity(
+    async def _place_spot_order(
         self,
-        amount_usdt: float,
-        price: float,
-        spot_symbol: str,
-    ) -> float | None:
-        """Calculate order quantity respecting min_amount and step_size.
+        coin: str,
+        is_buy: bool,
+        sz: float,
+        meta: AssetMeta,
+    ) -> Optional[Dict[str, Any]]:
+        """Place an IOC limit order on the spot market.
 
-        Uses the spot exchange market info to align the quantity.
+        In Dry-Run mode, returns a simulated fill.
         """
-        assert self._spot_exchange is not None
-
-        market = self._spot_exchange.markets.get(spot_symbol)
-        if market is None:
-            logger.error("Market info not found for {}", spot_symbol)
+        state = self._states.get(coin)
+        if state is None:
             return None
 
-        raw_qty = amount_usdt / price
+        # Determine limit price with slippage
+        if is_buy:
+            limit_px = state.spot_best_ask * (1 + self._settings.slippage_tolerance)
+        else:
+            limit_px = state.spot_best_bid * (1 - self._settings.slippage_tolerance)
 
-        # Apply step-size precision via ccxt's amount_to_precision
-        try:
-            qty = float(
-                self._spot_exchange.amount_to_precision(spot_symbol, raw_qty)
-            )
-        except Exception:
-            logger.warning(
-                "Precision adjustment failed for {}; using raw qty", spot_symbol
-            )
-            qty = raw_qty
+        limit_px = round(limit_px, meta.px_decimals)
+        sz = round(sz, meta.sz_decimals)
 
-        # Check minimum trade amount
-        min_amount = market.get("limits", {}).get("amount", {}).get("min")
-        if min_amount is not None and qty < float(min_amount):
-            logger.warning(
-                "{}: qty {} below minimum {}",
-                spot_symbol,
-                qty,
-                min_amount,
-            )
-            return None
+        if self._settings.dry_run:
+            return self._simulate_fill(coin, "spot", is_buy, sz, limit_px)
 
-        return qty
-
-    async def _place_order(
-        self,
-        exchange: ccxt.Exchange,
-        symbol: str,
-        side: str,
-        qty: float,
-        params: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Place a market order via the exchange.
-
-        Wraps ``exchange.create_market_order`` with retry on transient errors.
-        """
-        max_retries = 3
-        for attempt in range(1, max_retries + 1):
-            try:
-                order = await exchange.create_market_order(
-                    symbol, side, qty, params=params or {}
-                )
-                logger.debug(
-                    "Order filled: {} {} {} qty={} id={}",
-                    exchange.id,
-                    side,
-                    symbol,
-                    qty,
-                    order.get("id"),
-                )
-                return order  # type: ignore[return-value]
-            except (ccxt.RateLimitExceeded, ccxt.NetworkError) as exc:
-                wait = 2**attempt
-                logger.warning(
-                    "Transient error on {} {} {} (attempt {}/{}): {} — retrying in {}s",
-                    side,
-                    symbol,
-                    exchange.id,
-                    attempt,
-                    max_retries,
-                    exc,
-                    wait,
-                )
-                await asyncio.sleep(wait)
-        raise RuntimeError(
-            f"Failed to execute {side} {symbol} after {max_retries} retries"
+        return await self._send_order(
+            coin=coin,
+            is_buy=is_buy,
+            sz=sz,
+            limit_px=limit_px,
+            meta=meta,
+            is_spot=True,
         )
 
-    async def _rollback(
+    async def _place_perp_order(
         self,
-        exchange: ccxt.Exchange,
-        symbol: str,
-        side: str,
-        qty: float,
-    ) -> None:
-        """Emergency rollback: execute opposite trade to flatten exposure."""
-        logger.warning("ROLLBACK: {} {} {} qty={}", side, symbol, exchange.id, qty)
-        try:
-            await exchange.create_market_order(symbol, side, qty)
-            logger.info("Rollback successful")
-        except Exception as exc:
-            logger.critical(
-                "ROLLBACK FAILED for {} {} — MANUAL INTERVENTION REQUIRED: {}",
-                side,
-                symbol,
-                exc,
-            )
+        coin: str,
+        is_buy: bool,
+        sz: float,
+        meta: AssetMeta,
+        reduce_only: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Place an IOC limit order on the perp market.
 
-    @staticmethod
-    def _sum_fees(order: dict[str, Any]) -> float:
-        """Extract total fee cost from a ccxt order response."""
-        fee = order.get("fee")
-        if fee and fee.get("cost") is not None:
-            return float(fee["cost"])
-        # Some exchanges return fees as a list
-        fees = order.get("fees", [])
-        return sum(float(f.get("cost", 0)) for f in fees if f)
+        In Dry-Run mode, returns a simulated fill.
+        """
+        state = self._states.get(coin)
+        if state is None:
+            return None
+
+        # Determine limit price with slippage
+        if is_buy:
+            limit_px = state.best_ask * (1 + self._settings.slippage_tolerance)
+        else:
+            limit_px = state.best_bid * (1 - self._settings.slippage_tolerance)
+
+        limit_px = round(limit_px, meta.px_decimals)
+        sz = round(sz, meta.sz_decimals)
+
+        if self._settings.dry_run:
+            return self._simulate_fill(coin, "perp", is_buy, sz, limit_px)
+
+        return await self._send_order(
+            coin=coin,
+            is_buy=is_buy,
+            sz=sz,
+            limit_px=limit_px,
+            meta=meta,
+            is_spot=False,
+            reduce_only=reduce_only,
+        )
+
+    async def _send_order(
+        self,
+        coin: str,
+        is_buy: bool,
+        sz: float,
+        limit_px: float,
+        meta: AssetMeta,
+        is_spot: bool = False,
+        reduce_only: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Send a real IOC order via the Hyperliquid SDK."""
+        if self._exchange is None:
+            logger.error("exchange_not_initialized")
+            return None
+
+        order_type = {"limit": {"tif": "Ioc"}}
+        max_retries = self._settings.max_retry_attempts
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                if is_spot:
+                    spot_coin = self._spot_coin_name(coin)
+                    if spot_coin is None:
+                        logger.error("no_spot_coin_name", coin=coin)
+                        return None
+                    result = self._exchange.order(
+                        spot_coin, is_buy, sz, limit_px, order_type,
+                        reduce_only=reduce_only,
+                    )
+                else:
+                    result = self._exchange.order(
+                        coin, is_buy, sz, limit_px, order_type,
+                        reduce_only=reduce_only,
+                    )
+
+                # Parse SDK response
+                status = result.get("status", "")
+                response = result.get("response", {})
+
+                if status == "ok":
+                    # Extract fill info from statuses
+                    statuses = response.get("data", {}).get("statuses", [])
+                    filled_sz = 0.0
+                    avg_price = limit_px
+
+                    for s in statuses:
+                        if isinstance(s, dict):
+                            if "filled" in s:
+                                filled_info = s["filled"]
+                                filled_sz += float(filled_info.get("totalSz", 0))
+                                avg_price = float(filled_info.get("avgPx", limit_px))
+                            elif "resting" in s:
+                                # IOC shouldn't rest, but handle gracefully
+                                logger.warning("ioc_order_resting", coin=coin)
+
+                    logger.info(
+                        "order_filled",
+                        coin=coin,
+                        side="buy" if is_buy else "sell",
+                        market="spot" if is_spot else "perp",
+                        filled_sz=filled_sz,
+                        avg_price=avg_price,
+                    )
+                    return {"filled_sz": filled_sz, "avg_price": avg_price}
+                else:
+                    logger.warning(
+                        "order_rejected",
+                        coin=coin,
+                        status=status,
+                        response=response,
+                        attempt=attempt,
+                    )
+
+            except Exception as exc:
+                wait = 2 ** attempt
+                logger.warning(
+                    "order_error",
+                    coin=coin,
+                    error=str(exc),
+                    attempt=attempt,
+                    retry_in=wait,
+                )
+                await asyncio.sleep(wait)
+
+        logger.error("order_max_retries_exceeded", coin=coin)
+        return None
+
+    # ------------------------------------------------------------------
+    # Dry-Run simulation
+    # ------------------------------------------------------------------
+
+    def _simulate_fill(
+        self,
+        coin: str,
+        market: str,
+        is_buy: bool,
+        sz: float,
+        limit_px: float,
+    ) -> Dict[str, Any]:
+        """Generate a synthetic fill for Dry-Run mode."""
+        state = self._states.get(coin)
+
+        # Apply slippage to simulate realistic fill
+        if market == "spot":
+            if is_buy:
+                fill_price = (
+                    state.spot_best_ask * (1 + self._settings.slippage_tolerance)
+                    if state else limit_px
+                )
+            else:
+                fill_price = (
+                    state.spot_best_bid * (1 - self._settings.slippage_tolerance)
+                    if state else limit_px
+                )
+        else:  # perp
+            if is_buy:
+                fill_price = (
+                    state.best_ask * (1 + self._settings.slippage_tolerance)
+                    if state else limit_px
+                )
+            else:
+                fill_price = (
+                    state.best_bid * (1 - self._settings.slippage_tolerance)
+                    if state else limit_px
+                )
+
+        notional = sz * fill_price
+        fee = notional * 0.00025  # ~0.025% typical taker fee
+
+        logger.info(
+            "dry_run_simulated_fill",
+            coin=coin,
+            market=market,
+            side="buy" if is_buy else "sell",
+            sz=sz,
+            fill_price=round(fill_price, 6),
+            notional=round(notional, 2),
+            fee=round(fee, 4),
+            order_id=str(uuid.uuid4())[:8],
+        )
+
+        return {"filled_sz": sz, "avg_price": fill_price}
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _spot_coin_name(self, base_coin: str) -> Optional[str]:
+        """Get the spot coin name for order submission."""
+        meta = self._asset_meta.get(base_coin)
+        if meta is None or meta.spot_asset_id is None:
+            return None
+        spot_index = meta.spot_asset_id - 10000
+        if base_coin == "PURR":
+            return "PURR/USDC"
+        return f"@{spot_index}"

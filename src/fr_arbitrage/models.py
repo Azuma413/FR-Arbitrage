@@ -1,51 +1,117 @@
-"""Pydantic data models for the FR-Arbitrage Bot.
+"""Data models for the Hyperliquid Yield Harvester.
 
-Corresponds to README §5 — Data Model Design.
+Includes:
+- SQLAlchemy ORM model for position persistence (README §5.1)
+- Pydantic models for in-memory state
+- Dataclasses for market state and asset metadata (README §4.1)
 """
 
 from __future__ import annotations
 
-import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+from sqlalchemy import Column, DateTime, Float, String, func
+from sqlalchemy.orm import DeclarativeBase
 
 
 # ---------------------------------------------------------------------------
-# 5.1  TargetSymbol — In-memory scan result
+# SQLAlchemy Base
+# ---------------------------------------------------------------------------
+
+class Base(DeclarativeBase):
+    """SQLAlchemy declarative base for all ORM models."""
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Position — DB-persisted (README §5.1)
+# ---------------------------------------------------------------------------
+
+class Position(Base):
+    """Tracks an open delta-neutral position (Spot + Perp Short).
+
+    Stored in the ``positions`` SQLite table for crash recovery.
+    """
+
+    __tablename__ = "positions"
+
+    symbol: str = Column(String, primary_key=True)  # e.g. "HYPE"
+    spot_sz: float = Column(Float, default=0.0)  # Spot quantity held
+    perp_sz: float = Column(Float, default=0.0)  # Perp short quantity
+    entry_price: float = Column(Float, default=0.0)  # Weighted avg entry
+    accumulated_funding: float = Column(Float, default=0.0)  # Total FR earned
+    state: str = Column(String, default="OPEN")  # OPEN / REBALANCING / CLOSING_PENDING
+    updated_at: datetime = Column(  # type: ignore[assignment]
+        DateTime(timezone=True),
+        default=func.now(),
+        onupdate=func.now(),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Position {self.symbol} spot={self.spot_sz} perp={self.perp_sz} "
+            f"state={self.state}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# AssetMeta — metadata per coin (README §4.1)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AssetMeta:
+    """Hyperliquid asset metadata for precise rounding.
+
+    Loaded once from ``info.meta()`` and ``info.spot_meta()`` at startup.
+    """
+
+    coin: str
+    perp_asset_id: Optional[int] = None  # Index in meta.universe
+    spot_asset_id: Optional[int] = None  # 10000 + index in spotMeta.universe
+    sz_decimals: int = 0  # Size precision
+    px_decimals: int = 2  # Price precision (derived from tick size)
+
+
+# ---------------------------------------------------------------------------
+# MarketState — in-memory, updated by WebSocket (README §3.1)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MarketState:
+    """Real-time market data for a single coin, kept in memory."""
+
+    coin: str
+    best_bid: float = 0.0
+    best_ask: float = 0.0
+    mid_price: float = 0.0
+    funding_rate: float = 0.0  # Current predicted hourly FR
+    open_interest: float = 0.0  # Open interest in USD
+    spot_best_bid: float = 0.0
+    spot_best_ask: float = 0.0
+    spot_mid_price: float = 0.0
+    last_updated: float = 0.0  # Unix timestamp
+
+    @property
+    def perp_spot_spread(self) -> float:
+        """(Spot Ask - Perp Bid) / Spot Ask — cost to enter."""
+        if self.spot_best_ask <= 0:
+            return float("inf")
+        return (self.spot_best_ask - self.best_bid) / self.spot_best_ask
+
+
+# ---------------------------------------------------------------------------
+# TargetSymbol — scan result passed to execution engine
 # ---------------------------------------------------------------------------
 
 class TargetSymbol(BaseModel):
-    """A market pair that passes the MarketScanner filters.
+    """A coin that passes the OpportunityScanner filters."""
 
-    Kept in-memory only; not persisted to the database.
-    """
-
-    symbol: str              # e.g. "DOGE/USDT"
-    funding_rate: float      # e.g. 0.0004 (= 0.04%)
-    spot_price: float
-    perp_price: float
-    spread_pct: float        # (perp - spot) / spot
-    volume_24h: float        # 24h volume in USDT
-
-
-# ---------------------------------------------------------------------------
-# 5.2  ActivePosition — Persisted to SQLite (`positions` table)
-# ---------------------------------------------------------------------------
-
-class ActivePosition(BaseModel):
-    """Tracks an open delta-neutral position (Spot + Perp Short).
-
-    Stored in the `positions` SQLite table for crash recovery.
-    """
-
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    symbol: str
-    entry_timestamp: int = Field(
-        default_factory=lambda: int(datetime.now(timezone.utc).timestamp())
-    )
-    spot_qty: float          # Spot quantity held
-    perp_qty: float          # Perp short quantity (positive = short size)
-    entry_spread: float      # Spread % at entry
-    total_fees: float = 0.0  # Cumulative fees in USDT
-    status: str = "OPEN"     # "OPEN" | "CLOSING" | "CLOSED"
+    coin: str  # e.g. "HYPE"
+    funding_rate: float
+    spot_ask: float
+    perp_bid: float
+    spread: float  # perp_spot_spread
+    open_interest: float
