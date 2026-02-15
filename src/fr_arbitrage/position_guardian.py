@@ -20,6 +20,7 @@ from fr_arbitrage.config import Settings
 from fr_arbitrage.database import get_open_positions, upsert_position
 from fr_arbitrage.models import AssetMeta, MarketState, Position
 from fr_arbitrage.order_manager import OrderManager
+from fr_arbitrage.virtual_wallet import VirtualWallet
 
 logger = structlog.get_logger()
 
@@ -33,11 +34,13 @@ class PositionGuardian:
         states: Dict[str, MarketState],
         asset_meta: Dict[str, AssetMeta],
         order_manager: OrderManager,
+        virtual_wallet: Optional[VirtualWallet] = None,
     ) -> None:
         self._settings = settings
         self._states = states
         self._asset_meta = asset_meta
         self._order_mgr = order_manager
+        self._virtual_wallet = virtual_wallet
         self._info: Optional[Info] = None
 
         # Track consecutive negative FR counts per coin
@@ -215,16 +218,29 @@ class PositionGuardian:
 
     async def _check_margin_and_rebalance(self, position: Position) -> None:
         """Check margin usage and reduce position if necessary."""
-        if self._info is None or self._settings.dry_run:
-            # In dry-run mode, skip margin queries (no real account state)
+        
+        account_value = 0.0
+        total_margin_used = 0.0
+
+        if self._settings.dry_run:
+            if self._virtual_wallet:
+                account_value = self._virtual_wallet.account_value
+                total_margin_used = self._virtual_wallet.total_margin_used
+            else:
+                return
+        elif self._info:
+             try:
+                user_state = self._info.user_state(self._settings.account_address)
+                margin_summary = user_state.get("marginSummary", {})
+                account_value = float(margin_summary.get("accountValue", 0))
+                total_margin_used = float(margin_summary.get("totalMarginUsed", 0))
+             except Exception as exc:
+                logger.warning("margin_check_error_live", error=str(exc))
+                return
+        else:
             return
 
         try:
-            user_state = self._info.user_state(self._settings.account_address)
-            margin_summary = user_state.get("marginSummary", {})
-            account_value = float(margin_summary.get("accountValue", 0))
-            total_margin_used = float(margin_summary.get("totalMarginUsed", 0))
-
             if account_value <= 0:
                 return
 

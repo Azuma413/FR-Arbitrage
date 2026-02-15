@@ -6,7 +6,11 @@ from __future__ import annotations
 
 import structlog
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, TYPE_CHECKING
+import time
+
+if TYPE_CHECKING:
+    from fr_arbitrage.models import MarketState
 
 logger = structlog.get_logger()
 
@@ -28,6 +32,7 @@ class VirtualWallet:
         
         # Hyperliquid specific margin parameters (approximate)
         self.margin_maintenance = 0.05 # 5% maintenance margin
+        self.last_funding_time = time.time()
         
         logger.info("virtual_wallet_initialized", balance=initial_balance)
 
@@ -36,27 +41,7 @@ class VirtualWallet:
         """Total equity = Balance + Unrealized PnL."""
         upnl = 0.0
         for pos in self._positions.values():
-            # Simply: size * (current_price - entry_price) for Long
-            # But we are doing arbitrage: Spot Long + Perp Short
-            # This class sees individual fills.
-            # However, `OrderManager` manages the strategy.
-            # Here we just track "cash" changes from fills (fees) 
-            # and potentially unrealized PnL if we track mark prices?
-            
-            # For simplicity in this first version:
-            # We will rely on "balance" being cash.
-            # But true account value needs Mark Price updates.
-            # If we don't stream mark prices here, we can't calculate uPnL accurately.
-            
-            # IMPROVEMENT: For now, we'll assume stable prices for uPnL or 
-            # just track realized PnL from closed trades if we can.
-            # Hyperliquid "accountValue" includes uPnL.
             pass
-        
-        # Since we don't easily get real-time mark prices pushed here without
-        # coupling tightly to MarketDataStreamer, let's approximate:
-        # account_value ~= balance (assuming delta neutral stability)
-        # adjusted by realized fees and funding (if we implement funding simulation).
         return self.balance
 
     @property
@@ -66,7 +51,7 @@ class VirtualWallet:
         # roughly.
         used = 0.0
         for pos in self._positions.values():
-             used += (pos.size * pos.entry_price) * self.margin_maintenance
+             used += (abs(pos.size) * pos.entry_price) * self.margin_maintenance
         return used
 
     @property
@@ -131,6 +116,7 @@ class VirtualWallet:
             elif (pos.size == 0):
                  pos.entry_price = px
             
+            
         pos.size = new_size
         
         logger.info(
@@ -141,3 +127,56 @@ class VirtualWallet:
             coin=coin,
             market=market
         )
+
+    def apply_funding(self, market_states: Dict[str, 'MarketState']) -> None:
+        """Check for hourly funding and apply payments if crossed."""
+        now = time.time()
+        current_hour = int(now / 3600)
+        last_hour = int(self.last_funding_time / 3600)
+        
+        if current_hour > last_hour:
+            total_funding_pnl = 0.0
+            
+            for key, pos in self._positions.items():
+                # Only perp positions pay/receive funding
+                if not key.endswith("-perp"):
+                    continue
+                    
+                # Extract coin symbol "HYPE-perp" -> "HYPE"
+                coin = pos.symbol.split("-")[0]
+                state = market_states.get(coin)
+                
+                if not state:
+                    continue
+                    
+                # Funding logic: 
+                # Funding Payment = -1 * Size * Price * Rate
+                # If Rate > 0: Longs pay (Size>0 -> Payment<0), Shorts receive (Size<0 -> Payment>0)
+                
+                # Use mark price (mid_price) for calculation
+                price = state.mid_price
+                if price <= 0:
+                    price = pos.entry_price # Fallback
+                
+                funding_pnl = -1 * pos.size * price * state.funding_rate
+                
+                total_funding_pnl += funding_pnl
+                
+                logger.info(
+                    "funding_applied_position",
+                    coin=coin,
+                    size=pos.size,
+                    rate=state.funding_rate,
+                    payment=funding_pnl
+                )
+            
+            if total_funding_pnl != 0:
+                self.balance += total_funding_pnl
+                logger.info(
+                    "hourly_funding_complete", 
+                    total_pnl=total_funding_pnl, 
+                    new_balance=self.balance
+                )
+                
+            self.last_funding_time = now
+

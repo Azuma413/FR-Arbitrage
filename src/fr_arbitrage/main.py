@@ -13,7 +13,7 @@ import asyncio
 import logging
 import signal
 import sys
-from typing import Set
+from typing import Dict, Optional, Set
 
 import structlog
 import wandb
@@ -22,6 +22,7 @@ from fr_arbitrage.config import Settings
 from fr_arbitrage.database import close_db, get_open_positions, init_db
 from fr_arbitrage.market_data import MarketDataStreamer
 from fr_arbitrage.market_scanner import OpportunityScanner
+from fr_arbitrage.models import MarketState
 from fr_arbitrage.order_manager import OrderManager
 from fr_arbitrage.position_guardian import PositionGuardian
 
@@ -108,7 +109,8 @@ from fr_arbitrage.virtual_wallet import VirtualWallet
 
 async def _monitor_funds(
     settings: Settings,
-    virtual_wallet: Optional[VirtualWallet] = None
+    virtual_wallet: Optional[VirtualWallet] = None,
+    market_states: Optional[Dict[str, MarketState]] = None,
 ) -> None:
     """Periodically log account funding/equity to WandB."""
     if not settings.wandb_enabled:
@@ -131,6 +133,9 @@ async def _monitor_funds(
         try:
             if virtual_wallet:
                 # Dry-Run: use virtual wallet
+                if market_states:
+                     virtual_wallet.apply_funding(market_states)
+
                 account_value = virtual_wallet.account_value
                 total_margin_used = virtual_wallet.total_margin_used
                 withdrawable = virtual_wallet.withdrawable
@@ -233,7 +238,7 @@ async def run_bot() -> None:
     scanner = OpportunityScanner(settings, streamer.states)
     order_mgr = OrderManager(settings, streamer.states, streamer.asset_meta, virtual_wallet)
     guardian = PositionGuardian(
-        settings, streamer.states, streamer.asset_meta, order_mgr
+        settings, streamer.states, streamer.asset_meta, order_mgr, virtual_wallet
     )
 
     await order_mgr.start()
@@ -260,7 +265,7 @@ async def run_bot() -> None:
             _scanner_loop(scanner, order_mgr, settings),  # Service 2: Scanner
             guardian.run(),                        # Service 3: Guardian
             _kill_switch_monitor(settings),        # Service 4: Health
-            _monitor_funds(settings, virtual_wallet), # Service 5: WandB Funds
+            _monitor_funds(settings, virtual_wallet, streamer.states), # Service 5: WandB Funds
 
 
         )
