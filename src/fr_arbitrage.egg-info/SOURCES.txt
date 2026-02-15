@@ -15,6 +15,3 @@ src/fr_arbitrage.egg-info/dependency_links.txt
 src/fr_arbitrage.egg-info/entry_points.txt
 src/fr_arbitrage.egg-info/requires.txt
 src/fr_arbitrage.egg-info/top_level.txt
-src/old/backtest.py
-src/old/fetch_data.py
-src/old/mocks.py

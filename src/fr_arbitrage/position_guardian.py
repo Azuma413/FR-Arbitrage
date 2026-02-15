@@ -14,6 +14,7 @@ from typing import Dict, Optional
 import structlog
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
+import wandb
 
 from fr_arbitrage.config import Settings
 from fr_arbitrage.database import get_open_positions, upsert_position
@@ -41,6 +42,7 @@ class PositionGuardian:
 
         # Track consecutive negative FR counts per coin
         self._negative_fr_counts: Dict[str, int] = {}
+        self._stop_event = asyncio.Event()
         self._running = False
 
     # ------------------------------------------------------------------
@@ -56,10 +58,12 @@ class PositionGuardian:
         )
         self._info = Info(base_url, skip_ws=True)
         self._running = True
+        self._stop_event.clear()
         logger.info("position_guardian_started")
 
     async def stop(self) -> None:
         self._running = False
+        self._stop_event.set()
         logger.info("position_guardian_stopped")
 
     # ------------------------------------------------------------------
@@ -68,13 +72,17 @@ class PositionGuardian:
 
     async def run(self) -> None:
         """Periodically check all open positions for exit/rebalance conditions."""
-        while self._running:
+        while not self._stop_event.is_set():
             try:
                 await self._check_all_positions()
             except Exception as exc:
                 logger.error("guardian_check_error", error=str(exc))
 
-            await asyncio.sleep(self._settings.guardian_interval_sec)
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=self._settings.guardian_interval_sec)
+                break
+            except asyncio.TimeoutError:
+                pass
 
     async def _check_all_positions(self) -> None:
         """Evaluate all open positions."""
@@ -107,8 +115,16 @@ class PositionGuardian:
                         coin=coin,
                         consecutive=count,
                     )
+
+                    if self._settings.wandb_enabled:
+                        wandb.log({
+                            "guardian/trigger_exit_negative_fr": 1, 
+                            "guardian/symbol": coin,
+                            "guardian/consecutive_negative_fr": count
+                        })
                     await self._close_position(position)
                     continue
+
             else:
                 # Reset counter when FR is positive
                 self._negative_fr_counts[coin] = 0
@@ -119,9 +135,17 @@ class PositionGuardian:
                     "exit_trigger_backwardation",
                     coin=coin,
                     spread=f"{state.perp_spot_spread:.4%}",
+
                 )
+                if self._settings.wandb_enabled:
+                    wandb.log({
+                        "guardian/trigger_exit_backwardation": 1,
+                        "guardian/symbol": coin,
+                        "guardian/spread": state.perp_spot_spread
+                    })
                 await self._close_position(position)
                 continue
+
 
             # --- Auto-deleverage: Check margin usage ---
             await self._check_margin_and_rebalance(position)

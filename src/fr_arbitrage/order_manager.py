@@ -22,6 +22,8 @@ import structlog
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
+import wandb
+
 
 from fr_arbitrage.config import Settings
 from fr_arbitrage.database import upsert_position
@@ -218,6 +220,15 @@ class OrderManager:
         )
         await upsert_position(position)
 
+        if self._settings.wandb_enabled:
+             wandb.log({
+                "trade/entry": 1,
+                "trade/symbol": coin,
+                "trade/entry_price": entry_price,
+                "trade/size": spot_filled,
+                "trade/notional_usdc": spot_filled * entry_price,
+            })
+
         logger.info(
             "entry_complete",
             coin=coin,
@@ -227,6 +238,7 @@ class OrderManager:
             dry_run=self._settings.dry_run,
         )
         return position
+
 
     # ------------------------------------------------------------------
     # Exit: Close both legs
@@ -273,17 +285,21 @@ class OrderManager:
         position.spot_sz = max(0.0, position.spot_sz - spot_filled)
         position.perp_sz = max(0.0, position.perp_sz - perp_filled)
 
-        # Allow small dust to be considered closed (e.g. < $1 value)
-        # For now, strict check: if both zero, closed.
         if position.spot_sz <= 0 and position.perp_sz <= 0:
             position.state = "CLOSED"
             await upsert_position(position)
             logger.info("exit_complete", coin=coin)
+
+            if self._settings.wandb_enabled:
+                wandb.log({
+                    "trade/exit": 1,
+                    "trade/symbol": coin,
+                    "trade/exit_type": "full", # or partial if we tracked that better
+                })
+
             return True
 
-        # Partial fill or failure
-        # Reset state to OPEN so Guardian can retry later
-        # (Guardian will see closing_attempts incremented in its own logic)
+
         position.state = "OPEN"
         await upsert_position(position)
         

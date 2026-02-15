@@ -33,6 +33,7 @@ class MarketDataStreamer:
         self.states: Dict[str, MarketState] = {}
         self.asset_meta: Dict[str, AssetMeta] = {}
 
+        self._stop_event = asyncio.Event()
         self._running = False
 
     # ------------------------------------------------------------------
@@ -80,11 +81,18 @@ class MarketDataStreamer:
                     logger.info("ws_subscribed", coin=spot_coin, channel="l2Book_spot")
 
         self._running = True
+        self._stop_event.clear()
         logger.info("market_data_streamer_started", coins=list(self.states.keys()))
 
     async def stop(self) -> None:
         """Stop the streamer."""
         self._running = False
+        self._stop_event.set()
+        
+        if self._info is not None:
+             if hasattr(self._info, "disconnect_websocket"):
+                 self._info.disconnect_websocket()
+        
         # The SDK's websocket will be closed when Info is garbage collected
         self._info = None
         logger.info("market_data_streamer_stopped")
@@ -98,12 +106,17 @@ class MarketDataStreamer:
 
         Should be launched as an ``asyncio.create_task``.
         """
-        while self._running:
+        while not self._stop_event.is_set():
             try:
                 await self._refresh_funding_and_oi()
             except Exception as exc:
                 logger.error("periodic_refresh_error", error=str(exc))
-            await asyncio.sleep(30)  # refresh every 30s
+            
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=30.0)
+                break
+            except asyncio.TimeoutError:
+                pass
 
     async def _refresh_funding_and_oi(self) -> None:
         """Fetch latest funding rates and open interest via Info API."""

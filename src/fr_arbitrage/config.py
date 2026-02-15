@@ -5,9 +5,10 @@ Corresponds to README §6.
 
 from __future__ import annotations
 
-from typing import List
-
+from typing import List, Optional
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
 
 
 class Settings(BaseSettings):
@@ -57,7 +58,31 @@ class Settings(BaseSettings):
     db_url: str = "sqlite+aiosqlite:///./yield_harvester.db"
     log_level: str = "INFO"
 
+    # --- WandB Logging ------------------------------------------------------
+    wandb_enabled: bool = False
+    wandb_project: str = "fr-arbitrage"
+    wandb_entity: str = ""  # Optional: Username or Team name
+    wandb_api_key: str = ""  # Optional: from env var WANDB_API_KEY
+
+    # Auto-enable WandB if API key is present and enabled isn't explicitly False
+    # (Pydantic validator would be ideal, but simple post-init logic in main is also fine.
+    #  Let's use a validator if possible, or just default enabled=True if key is there? 
+    #  Simpler: If key is present, default enabled to True in post-init or use validator)
+    
+    
+    @model_validator(mode="after")
+    def _enable_wandb_if_key_present(self) -> Settings:
+
+        if self.wandb_api_key and not self.wandb_enabled:
+             # Only auto-enable if it wasn't explicitly disabled? 
+             # Actually, if user provided key, they probably want it.
+             # But 'wandb_enabled' defaults to False.
+             # So if key is present, we flip it to True.
+             self.wandb_enabled = True
+        return self
+
     # --- Scan / Guardian intervals (seconds) --------------------------------
+
     scan_interval_sec: int = 60
     guardian_interval_sec: int = 30
 

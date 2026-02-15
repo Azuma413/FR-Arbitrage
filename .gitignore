@@ -1,5 +1,5 @@
 .env
 uv.lock
 __pycache__
-*.txt
 *.db
+wandb

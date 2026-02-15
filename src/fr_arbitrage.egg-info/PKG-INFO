@@ -11,6 +11,7 @@ Requires-Dist: pydantic-settings>=2.0
 Requires-Dist: structlog>=24.0
 Requires-Dist: sqlalchemy>=2.0
 Requires-Dist: aiosqlite>=0.19
+Requires-Dist: wandb>=0.25.0
 
 # プロジェクト仕様書（最終版）: Hyperliquid Yield Harvester
 

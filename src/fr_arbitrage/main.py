@@ -16,6 +16,7 @@ import sys
 from typing import Set
 
 import structlog
+import wandb
 
 from fr_arbitrage.config import Settings
 from fr_arbitrage.database import close_db, get_open_positions, init_db
@@ -95,9 +96,53 @@ async def _kill_switch_monitor(settings: Settings) -> None:
                 return
         except Exception:
             pass
+        
+        try:
+             await asyncio.wait_for(_shutdown_event.wait(), timeout=5.0)
+             break
+        except asyncio.TimeoutError:
+             pass
+
+
+async def _monitor_funds(settings: Settings) -> None:
+    """Periodically log account funding/equity to WandB."""
+    if not settings.wandb_enabled:
+        return
+
+    # Helper to get exchange info
+    from hyperliquid.info import Info
+    from hyperliquid.utils import constants
+
+    base_url = (
+        constants.MAINNET_API_URL
+        if settings.environment.upper() == "MAINNET"
+        else constants.TESTNET_API_URL
+    )
+    info = Info(base_url, skip_ws=True)
+
+    while not _shutdown_event.is_set():
+        try:
+            user_state = info.user_state(settings.account_address)
+            margin_summary = user_state.get("marginSummary", {})
+            account_value = float(margin_summary.get("accountValue", 0))
+            total_margin_used = float(margin_summary.get("totalMarginUsed", 0))
+            withdrawable = float(user_state.get("withdrawable", 0))
+
+            wandb.log(
+                {
+                    "wallet/account_value": account_value,
+                    "wallet/margin_used": total_margin_used,
+                    "wallet/withdrawable": withdrawable,
+                    "wallet/margin_usage_pct": (
+                        total_margin_used / account_value if account_value > 0 else 0
+                    ),
+                }
+            )
+        except Exception as e:
+             logger.error("wandb_funds_monitor_error", error=str(e))
 
         try:
-            await asyncio.wait_for(_shutdown_event.wait(), timeout=5.0)
+            await asyncio.wait_for(_shutdown_event.wait(), timeout=60.0)
             break
         except asyncio.TimeoutError:
             pass
@@ -136,6 +181,14 @@ async def run_bot() -> None:
 
     log = structlog.get_logger()
 
+    if settings.wandb_enabled:
+        wandb.init(
+            project=settings.wandb_project,
+            entity=settings.wandb_entity or None,
+            config=settings.model_dump(),
+        )
+        log.info("wandb_initialized")
+
     log.info(
         "bot_starting",
         environment=settings.environment,
@@ -168,18 +221,21 @@ async def run_bot() -> None:
     # --- Setup signal handlers for graceful shutdown ------------------------
     loop = asyncio.get_running_loop()
 
-    if sys.platform == "win32":
-        # Windows: specific handling required as add_signal_handler is not supported
-        def handle_signal(signum, frame):
-            # Schedule the shutdown event in the loop
-            loop.call_soon_threadsafe(_shutdown_event.set)
-
-        signal.signal(signal.SIGINT, handle_signal)
-        signal.signal(signal.SIGTERM, handle_signal)
-    else:
-        # Unix: Use standard asyncio signal handlers
+    # Standard signal handling for graceful shutdown
+    # On Windows, Ctrl+C raises KeyboardInterrupt which asyncio.run catches.
+    # We also add SIGTERM support for other shutdown scenarios.
+    if sys.platform != "win32":
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, _shutdown_event.set)
+    else:
+        # On Windows, we refrain from overriding SIGINT to allow KeyboardInterrupt
+        # to bubble up naturally from the event loop, which main() handles.
+        # We only handle SIGTERM if possible (though often not supported on Windows python without specialized libs).
+        try:
+            signal.signal(signal.SIGTERM, lambda *_: loop.call_soon_threadsafe(_shutdown_event.set))
+        except (AttributeError, ValueError):
+            pass # SIGTERM might not be available or settable
+
 
     log.info("all_services_initialized")
 
@@ -190,6 +246,8 @@ async def run_bot() -> None:
             _scanner_loop(scanner, order_mgr, settings),  # Service 2: Scanner
             guardian.run(),                        # Service 3: Guardian
             _kill_switch_monitor(settings),        # Service 4: Health
+            _monitor_funds(settings),              # Service 5: WandB Funds
+
         )
     except asyncio.CancelledError:
         log.info("tasks_cancelled")
@@ -201,6 +259,8 @@ async def run_bot() -> None:
         await streamer.stop()
         await order_mgr.close()
         await close_db()
+        if settings.wandb_enabled:
+            wandb.finish()
         log.info("bot_stopped")
 
 
