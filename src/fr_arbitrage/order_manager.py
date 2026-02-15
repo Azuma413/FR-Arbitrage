@@ -32,6 +32,8 @@ from fr_arbitrage.models import AssetMeta, MarketState, Position, TargetSymbol
 logger = structlog.get_logger()
 
 
+from fr_arbitrage.virtual_wallet import VirtualWallet
+
 class OrderManager:
     """Executes delta-neutral entry / exit orders with leg-risk safeguards.
 
@@ -43,12 +45,15 @@ class OrderManager:
         settings: Settings,
         states: Dict[str, MarketState],
         asset_meta: Dict[str, AssetMeta],
+        virtual_wallet: Optional[VirtualWallet] = None,
     ) -> None:
         self._settings = settings
         self._states = states
         self._asset_meta = asset_meta
+        self._virtual_wallet = virtual_wallet
         self._exchange: Optional[Exchange] = None
         self._info: Optional[Info] = None
+
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -517,6 +522,16 @@ class OrderManager:
         notional = sz * fill_price
         fee = notional * 0.00025
 
+        if self._virtual_wallet:
+             self._virtual_wallet.update_on_fill(
+                 coin=coin,
+                 market=market,
+                 side="buy" if is_buy else "sell",
+                 sz=sz,
+                 px=fill_price,
+                 fee=fee
+             )
+
         logger.info(
             "dry_run_simulated_fill",
             coin=coin,
@@ -529,6 +544,7 @@ class OrderManager:
             notional=round(notional, 2),
             fee=round(fee, 4),
             order_id=str(uuid.uuid4())[:8],
+            wallet_balance=self._virtual_wallet.balance if self._virtual_wallet else "N/A"
         )
 
         return {"filled_sz": sz, "avg_price": fill_price}

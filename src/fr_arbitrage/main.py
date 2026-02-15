@@ -104,7 +104,12 @@ async def _kill_switch_monitor(settings: Settings) -> None:
              pass
 
 
-async def _monitor_funds(settings: Settings) -> None:
+from fr_arbitrage.virtual_wallet import VirtualWallet
+
+async def _monitor_funds(
+    settings: Settings,
+    virtual_wallet: Optional[VirtualWallet] = None
+) -> None:
     """Periodically log account funding/equity to WandB."""
     if not settings.wandb_enabled:
         return
@@ -113,20 +118,29 @@ async def _monitor_funds(settings: Settings) -> None:
     from hyperliquid.info import Info
     from hyperliquid.utils import constants
 
-    base_url = (
-        constants.MAINNET_API_URL
-        if settings.environment.upper() == "MAINNET"
-        else constants.TESTNET_API_URL
-    )
-    info = Info(base_url, skip_ws=True)
+    if not virtual_wallet:
+        # Real mode: setup Info client
+        base_url = (
+            constants.MAINNET_API_URL
+            if settings.environment.upper() == "MAINNET"
+            else constants.TESTNET_API_URL
+        )
+        info = Info(base_url, skip_ws=True)
 
     while not _shutdown_event.is_set():
         try:
-            user_state = info.user_state(settings.account_address)
-            margin_summary = user_state.get("marginSummary", {})
-            account_value = float(margin_summary.get("accountValue", 0))
-            total_margin_used = float(margin_summary.get("totalMarginUsed", 0))
-            withdrawable = float(user_state.get("withdrawable", 0))
+            if virtual_wallet:
+                # Dry-Run: use virtual wallet
+                account_value = virtual_wallet.account_value
+                total_margin_used = virtual_wallet.total_margin_used
+                withdrawable = virtual_wallet.withdrawable
+            else:
+                # Live: query exchange
+                user_state = info.user_state(settings.account_address)
+                margin_summary = user_state.get("marginSummary", {})
+                account_value = float(margin_summary.get("accountValue", 0))
+                total_margin_used = float(margin_summary.get("totalMarginUsed", 0))
+                withdrawable = float(user_state.get("withdrawable", 0))
 
             wandb.log(
                 {
@@ -146,6 +160,7 @@ async def _monitor_funds(settings: Settings) -> None:
             break
         except asyncio.TimeoutError:
             pass
+
 
 
 # ---------------------------------------------------------------------------
@@ -208,9 +223,15 @@ async def run_bot() -> None:
     streamer = MarketDataStreamer(settings)
     await streamer.start()
 
+    # --- Initialize Virtual Wallet (Dry-Run only) ---------------------------
+    virtual_wallet = None
+    if settings.dry_run:
+        from fr_arbitrage.virtual_wallet import VirtualWallet
+        virtual_wallet = VirtualWallet(settings.dry_run_initial_balance)
+
     # --- Initialize components (sharing streamer's state) -------------------
     scanner = OpportunityScanner(settings, streamer.states)
-    order_mgr = OrderManager(settings, streamer.states, streamer.asset_meta)
+    order_mgr = OrderManager(settings, streamer.states, streamer.asset_meta, virtual_wallet)
     guardian = PositionGuardian(
         settings, streamer.states, streamer.asset_meta, order_mgr
     )
@@ -239,7 +260,8 @@ async def run_bot() -> None:
             _scanner_loop(scanner, order_mgr, settings),  # Service 2: Scanner
             guardian.run(),                        # Service 3: Guardian
             _kill_switch_monitor(settings),        # Service 4: Health
-            _monitor_funds(settings),              # Service 5: WandB Funds
+            _monitor_funds(settings, virtual_wallet), # Service 5: WandB Funds
+
 
         )
     except asyncio.CancelledError:

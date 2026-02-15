@@ -49,6 +49,7 @@ class Settings(BaseSettings):
 
     # --- Dry-Run Mode -------------------------------------------------------
     dry_run: bool = False  # Paper trading: Mainnet data, simulated fills
+    dry_run_initial_balance: float = 10000.0  # Initial fake USDC for Dry-Run
 
     # --- Position Guardian --------------------------------------------------
     exit_negative_fr_count: int = 3  # Exit after N consecutive negative FR
