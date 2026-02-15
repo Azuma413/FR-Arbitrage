@@ -66,8 +66,6 @@ class OpportunityScanner:
                 continue
 
             # --- Filter 3: Spread check ---
-            # (Spot Ask - Perp Bid) / Spot Ask should be less than
-            # estimated 24h funding income
             spread = state.perp_spot_spread
             estimated_24h_funding = state.funding_rate * 24  # hourly → daily
             if spread >= estimated_24h_funding:

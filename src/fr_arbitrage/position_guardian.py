@@ -165,8 +165,6 @@ class PositionGuardian:
         logger.info("guardian_manual_trigger", coin=coin)
         # Real logic: fetch position from DB and check it
         try:
-             # Re-use logic by calling singular check if implemented, or just wait for next loop.
-             # For now, we rely on next loop, but we can log that we are aware.
              pass
         except Exception as exc:
              logger.error("manual_check_error", error=str(exc))

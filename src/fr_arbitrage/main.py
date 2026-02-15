@@ -220,17 +220,10 @@ async def run_bot() -> None:
 
     # --- Setup signal handlers for graceful shutdown ------------------------
     loop = asyncio.get_running_loop()
-
-    # Standard signal handling for graceful shutdown
-    # On Windows, Ctrl+C raises KeyboardInterrupt which asyncio.run catches.
-    # We also add SIGTERM support for other shutdown scenarios.
     if sys.platform != "win32":
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, _shutdown_event.set)
     else:
-        # On Windows, we refrain from overriding SIGINT to allow KeyboardInterrupt
-        # to bubble up naturally from the event loop, which main() handles.
-        # We only handle SIGTERM if possible (though often not supported on Windows python without specialized libs).
         try:
             signal.signal(signal.SIGTERM, lambda *_: loop.call_soon_threadsafe(_shutdown_event.set))
         except (AttributeError, ValueError):

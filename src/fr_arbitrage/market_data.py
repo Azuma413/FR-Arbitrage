@@ -242,8 +242,6 @@ class MarketDataStreamer:
             token_map = {i: t["name"] for i, t in enumerate(tokens)}
 
             # 1. Collect all spot assets, grouped by potential base name
-            #    We store specific details to help prioritization later.
-            #    Structure: { base_coin_name: [ (spot_entry, quote_coin_name), ... ] }
             candidates: Dict[str, List[tuple]] = {}
 
             for idx, spot in enumerate(spot_universe):
@@ -271,10 +269,6 @@ class MarketDataStreamer:
 
             # 2. Match Perp Assets to best Spot Candidate
             for coin, meta in self.asset_meta.items():
-                # Strategy:
-                # 1. Exact match (e.g. HYPE -> HYPE)
-                # 2. "U"-prefix match for majors (e.g. SOL -> USOL, ETH -> UETH)
-                
                 matches = candidates.get(coin)
                 
                 if not matches:
@@ -283,8 +277,6 @@ class MarketDataStreamer:
                     matches = candidates.get(u_coin)
 
                 if matches:
-                    # Prioritize by Quote Currency: USDC > USDT > others
-                    # Sort key: 0 if USDC, 1 if USDT, 2 others
                     def quote_priority(item):
                         q = item[2] # quote_coin
                         if q == "USDC": return 0
