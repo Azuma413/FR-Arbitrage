@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+src/fr_arbitrage/__init__.py
+src/fr_arbitrage/config.py
+src/fr_arbitrage/main.py
+src/fr_arbitrage/market_scanner.py
+src/fr_arbitrage/models.py
+src/fr_arbitrage/order_manager.py
+src/fr_arbitrage.egg-info/PKG-INFO
+src/fr_arbitrage.egg-info/SOURCES.txt
+src/fr_arbitrage.egg-info/dependency_links.txt
+src/fr_arbitrage.egg-info/entry_points.txt
+src/fr_arbitrage.egg-info/requires.txt
+src/fr_arbitrage.egg-info/top_level.txt
