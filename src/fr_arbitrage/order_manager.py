@@ -159,9 +159,34 @@ class OrderManager:
         if perp_result is None or perp_result["filled_sz"] <= 0:
             # ROLLBACK: sell spot to flatten
             logger.error("perp_entry_failed_rollback", coin=coin)
-            await self._place_spot_order(
+            rollback_res = await self._place_spot_order(
                 coin, is_buy=False, sz=spot_filled, meta=meta
             )
+            
+            # Check if rollback succeeded
+            rollback_filled = 0.0
+            if rollback_res:
+                rollback_filled = rollback_res.get("filled_sz", 0.0)
+            
+            remaining_spot = spot_filled - rollback_filled
+            if remaining_spot > 0:
+                 logger.critical(
+                     "entry_rollback_failed", 
+                     coin=coin, 
+                     remaining_spot=remaining_spot
+                 )
+                 # Persist the IMBALANCED position so Guardian can fix it
+                 position = Position(
+                    symbol=coin,
+                    spot_sz=remaining_spot,
+                    perp_sz=0.0,
+                    entry_price=spot_price,
+                    accumulated_funding=0.0,
+                    state="OPEN", # Guardian will see delta imbalance and fix
+                )
+                 await upsert_position(position)
+                 return position # Return the imbalanced position
+            
             return None
 
         perp_filled = perp_result["filled_sz"]
@@ -207,7 +232,7 @@ class OrderManager:
     # Exit: Close both legs
     # ------------------------------------------------------------------
 
-    async def execute_exit(self, position: Position) -> bool:
+    async def execute_exit(self, position: Position, slippage_override: Optional[float] = None) -> bool:
         """Close the delta-neutral position (Spot Sell + Perp Cover).
 
         Returns True if both legs closed successfully.
@@ -241,28 +266,34 @@ class OrderManager:
         results = await asyncio.gather(spot_task, perp_task, return_exceptions=True)
         spot_result, perp_result = results
 
-        spot_ok = (
-            not isinstance(spot_result, BaseException)
-            and spot_result is not None
-            and spot_result.get("filled_sz", 0) > 0
-        )
-        perp_ok = (
-            not isinstance(perp_result, BaseException)
-            and perp_result is not None
-            and perp_result.get("filled_sz", 0) > 0
-        )
+        # Calculate remaining sizes
+        spot_filled = spot_result.get("filled_sz", 0) if (spot_result and not isinstance(spot_result, BaseException)) else 0
+        perp_filled = perp_result.get("filled_sz", 0) if (perp_result and not isinstance(perp_result, BaseException)) else 0
+        
+        position.spot_sz = max(0.0, position.spot_sz - spot_filled)
+        position.perp_sz = max(0.0, position.perp_sz - perp_filled)
 
-        if spot_ok and perp_ok:
+        # Allow small dust to be considered closed (e.g. < $1 value)
+        # For now, strict check: if both zero, closed.
+        if position.spot_sz <= 0 and position.perp_sz <= 0:
             position.state = "CLOSED"
             await upsert_position(position)
             logger.info("exit_complete", coin=coin)
             return True
 
-        logger.error(
-            "exit_partially_failed",
+        # Partial fill or failure
+        # Reset state to OPEN so Guardian can retry later
+        # (Guardian will see closing_attempts incremented in its own logic)
+        position.state = "OPEN"
+        await upsert_position(position)
+        
+        logger.warning(
+            "exit_partially_filled",
             coin=coin,
-            spot_ok=spot_ok,
-            perp_ok=perp_ok,
+            spot_filled=spot_filled,
+            perp_filled=perp_filled,
+            remaining_spot=position.spot_sz,
+            remaining_perp=position.perp_sz,
         )
         return False
 
@@ -445,33 +476,30 @@ class OrderManager:
     ) -> Dict[str, Any]:
         """Generate a synthetic fill for Dry-Run mode."""
         state = self._states.get(coin)
+        
+        # Use market price if available, else limit
+        market_px = limit_px
+        if state:
+            if market == "spot":
+                # For buy, use Ask; for sell, use Bid
+                market_px = state.spot_best_ask if is_buy else state.spot_best_bid
+            else:
+                market_px = state.best_ask if is_buy else state.best_bid
+        
+        if market_px <= 0:
+            market_px = limit_px
 
-        # Apply slippage to simulate realistic fill
-        if market == "spot":
-            if is_buy:
-                fill_price = (
-                    state.spot_best_ask * (1 + self._settings.slippage_tolerance)
-                    if state else limit_px
-                )
-            else:
-                fill_price = (
-                    state.spot_best_bid * (1 - self._settings.slippage_tolerance)
-                    if state else limit_px
-                )
-        else:  # perp
-            if is_buy:
-                fill_price = (
-                    state.best_ask * (1 + self._settings.slippage_tolerance)
-                    if state else limit_px
-                )
-            else:
-                fill_price = (
-                    state.best_bid * (1 - self._settings.slippage_tolerance)
-                    if state else limit_px
-                )
+        # Simulating realistic slippage (0.1%) + fee (0.025%)
+        # Buy: price increases. Sell: price decreases.
+        impact = 0.001
+        
+        if is_buy:
+             fill_price = market_px * (1 + impact)
+        else:
+             fill_price = market_px * (1 - impact)
 
         notional = sz * fill_price
-        fee = notional * 0.00025  # ~0.025% typical taker fee
+        fee = notional * 0.00025
 
         logger.info(
             "dry_run_simulated_fill",
@@ -479,7 +507,9 @@ class OrderManager:
             market=market,
             side="buy" if is_buy else "sell",
             sz=sz,
+            market_px=round(market_px, 6),
             fill_price=round(fill_price, 6),
+            limit_px=round(limit_px, 6),
             notional=round(notional, 2),
             fee=round(fee, 4),
             order_id=str(uuid.uuid4())[:8],

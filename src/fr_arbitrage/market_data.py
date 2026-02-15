@@ -223,51 +223,92 @@ class MarketDataStreamer:
         try:
             spot_meta = self._info.spot_meta()
             spot_universe = spot_meta.get("universe", [])
+            tokens = spot_meta.get("tokens", [])
+            
+            # Map token index to token name
+            token_map = {i: t["name"] for i, t in enumerate(tokens)}
+
+            # 1. Collect all spot assets, grouped by potential base name
+            #    We store specific details to help prioritization later.
+            #    Structure: { base_coin_name: [ (spot_entry, quote_coin_name), ... ] }
+            candidates: Dict[str, List[tuple]] = {}
+
             for idx, spot in enumerate(spot_universe):
-                tokens = spot.get("tokens", [])
                 spot_name = spot.get("name", "")
+                spot_tokens = spot.get("tokens", [])  # [base_token_idx, quote_token_idx]
+                
+                base_coin = None
+                quote_coin = None
+                
+                if len(spot_tokens) >= 2:
+                    base_coin = token_map.get(spot_tokens[0])
+                    quote_coin = token_map.get(spot_tokens[1])
+                
+                # Fallback parsing
+                if not base_coin and "/" in spot_name:
+                    parts = spot_name.split("/")
+                    base_coin = parts[0]
+                    quote_coin = parts[1] if len(parts) > 1 else None
 
-                # Determine the base coin name
-                # spot_meta tokens reference token indices; we need to match
-                # The coin name in perp universe might differ
-                coin_name = spot_name.split("/")[0] if "/" in spot_name else spot_name
+                if base_coin:
+                    if base_coin not in candidates:
+                        candidates[base_coin] = []
+                    # Store (spot_universe_index, spot_name, quote_coin)
+                    candidates[base_coin].append((idx, spot_name, quote_coin))
 
-                if coin_name in self.asset_meta:
-                    self.asset_meta[coin_name].spot_asset_id = 10000 + idx
-                    logger.debug(
-                        "spot_meta_loaded",
-                        coin=coin_name,
-                        spot_asset_id=10000 + idx,
+            # 2. Match Perp Assets to best Spot Candidate
+            for coin, meta in self.asset_meta.items():
+                # Strategy:
+                # 1. Exact match (e.g. HYPE -> HYPE)
+                # 2. "U"-prefix match for majors (e.g. SOL -> USOL, ETH -> UETH)
+                
+                matches = candidates.get(coin)
+                
+                if not matches:
+                    # Try U-prefix
+                    u_coin = "U" + coin
+                    matches = candidates.get(u_coin)
+
+                if matches:
+                    # Prioritize by Quote Currency: USDC > USDT > others
+                    # Sort key: 0 if USDC, 1 if USDT, 2 others
+                    def quote_priority(item):
+                        q = item[2] # quote_coin
+                        if q == "USDC": return 0
+                        if q in ("USDT", "USDT0", "USDE"): return 1
+                        return 2
+
+                    matches.sort(key=quote_priority)
+                    
+                    best_match = matches[0]
+                    spot_idx = best_match[0]
+                    spot_name = best_match[1]
+                    
+                    meta.spot_asset_id = 10000 + spot_idx
+                    meta.spot_name = spot_name
+                    
+                    logger.info(
+                        "spot_meta_associated",
+                        perp_coin=coin,
+                        spot_base=coin if matches == candidates.get(coin) else "U"+coin,
                         spot_name=spot_name,
+                        quote=best_match[2]
                     )
+
         except Exception as exc:
             logger.error("spot_meta_load_error", error=str(exc))
 
     def _spot_coin_name(self, base_coin: str) -> Optional[str]:
-        """Get the spot coin name for WebSocket subscription.
-
-        For PURR it's 'PURR/USDC', for others it's '@{index}'.
-        """
+        """Get the spot coin name for WebSocket subscription."""
         meta = self.asset_meta.get(base_coin)
-        if meta is None or meta.spot_asset_id is None:
-            return None
-
-        spot_index = meta.spot_asset_id - 10000
-        if base_coin == "PURR":
-            return "PURR/USDC"
-        return f"@{spot_index}"
+        if meta and meta.spot_name:
+            return meta.spot_name
+        return None
 
     def _resolve_base_coin(self, spot_coin: str) -> Optional[str]:
         """Resolve a spot coin name back to the base coin."""
-        if spot_coin == "PURR/USDC":
-            return "PURR"
-        if spot_coin.startswith("@"):
-            try:
-                idx = int(spot_coin[1:])
-                target_id = 10000 + idx
-                for coin, meta in self.asset_meta.items():
-                    if meta.spot_asset_id == target_id:
-                        return coin
-            except ValueError:
-                pass
+        # Check direct mapping from loaded metadata
+        for coin, meta in self.asset_meta.items():
+            if meta.spot_name == spot_coin:
+                return coin
         return None

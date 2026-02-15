@@ -71,6 +71,7 @@ class AssetMeta:
     coin: str
     perp_asset_id: Optional[int] = None  # Index in meta.universe
     spot_asset_id: Optional[int] = None  # 10000 + index in spotMeta.universe
+    spot_name: Optional[str] = None  # Canonical name for WS (e.g. "@107", "PURR/USDC")
     sz_decimals: int = 0  # Size precision
     px_decimals: int = 2  # Price precision (derived from tick size)
 

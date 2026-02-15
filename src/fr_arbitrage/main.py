@@ -64,6 +64,11 @@ async def _scanner_loop(
                     target, settings.max_position_usdc
                 )
                 if position is not None:
+                    # Check if position is imbalanced (entry failed rollback)
+                    if position.perp_sz <= 0 and position.spot_sz > 0:
+                         logger.warning("imbalanced_entry_detected_triggering_guardian", coin=position.symbol)
+                         pass
+
                     open_count += 1
 
         except Exception as exc:

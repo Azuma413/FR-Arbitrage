@@ -126,7 +126,7 @@ class PositionGuardian:
             # --- Auto-deleverage: Check margin usage ---
             await self._check_margin_and_rebalance(position)
 
-            # --- Accumulate funding income tracking ---
+            # --- Funding Income Tracking ---
             if state.funding_rate > 0:
                 # Estimate funding income per check interval
                 hours_per_check = self._settings.guardian_interval_sec / 3600
@@ -135,20 +135,56 @@ class PositionGuardian:
                 position.accumulated_funding += funding_income
                 await upsert_position(position)
 
+    async def check_position_now(self, coin: str) -> None:
+        """Manually trigger a check for a specific coin (used after entry failure)."""
+        position = await self._order_mgr._states.get(coin) # Just logging for now
+        logger.info("guardian_manual_trigger", coin=coin)
+        # Real logic: fetch position from DB and check it
+        try:
+             # Re-use logic by calling singular check if implemented, or just wait for next loop.
+             # For now, we rely on next loop, but we can log that we are aware.
+             pass
+        except Exception as exc:
+             logger.error("manual_check_error", error=str(exc))
+
     # ------------------------------------------------------------------
     # Exit
     # ------------------------------------------------------------------
 
+    # Track stuck positions: coin -> attempts
+    _closing_attempts: Dict[str, int] = {}
+
     async def _close_position(self, position: Position) -> None:
         """Close both legs of a position."""
+        coin = position.symbol
+        
+        # Track attempts
+        attempts = self._closing_attempts.get(coin, 0) + 1
+        self._closing_attempts[coin] = attempts
+        
+        if attempts > 10:
+            logger.critical(
+                "STUCK_POSITION_ALERT",
+                coin=coin,
+                attempts=attempts,
+                hint="Manual intervention required or increase slippage/retry limits.",
+            )
+            # Optionally: stop retrying to avoid spamming API?
+            # return 
+
         position.state = "CLOSING_PENDING"
         await upsert_position(position)
 
+        # Allow higher slippage if stuck? Could pass attempts to execute_exit
         success = await self._order_mgr.execute_exit(position)
-        if not success:
+        
+        if success:
+            self._closing_attempts.pop(coin, None)
+        else:
             logger.error(
                 "position_close_failed",
                 coin=position.symbol,
+                attempt=attempts
             )
 
     # ------------------------------------------------------------------
