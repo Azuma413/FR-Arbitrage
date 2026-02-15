@@ -167,12 +167,19 @@ async def run_bot() -> None:
 
     # --- Setup signal handlers for graceful shutdown ------------------------
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
+
+    if sys.platform == "win32":
+        # Windows: specific handling required as add_signal_handler is not supported
+        def handle_signal(signum, frame):
+            # Schedule the shutdown event in the loop
+            loop.call_soon_threadsafe(_shutdown_event.set)
+
+        signal.signal(signal.SIGINT, handle_signal)
+        signal.signal(signal.SIGTERM, handle_signal)
+    else:
+        # Unix: Use standard asyncio signal handlers
+        for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, _shutdown_event.set)
-        except NotImplementedError:
-            # Windows doesn't support add_signal_handler
-            pass
 
     log.info("all_services_initialized")
 

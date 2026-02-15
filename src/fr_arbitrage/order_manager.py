@@ -524,9 +524,6 @@ class OrderManager:
     def _spot_coin_name(self, base_coin: str) -> Optional[str]:
         """Get the spot coin name for order submission."""
         meta = self._asset_meta.get(base_coin)
-        if meta is None or meta.spot_asset_id is None:
-            return None
-        spot_index = meta.spot_asset_id - 10000
-        if base_coin == "PURR":
-            return "PURR/USDC"
-        return f"@{spot_index}"
+        if meta and meta.spot_name:
+            return meta.spot_name
+        return None
