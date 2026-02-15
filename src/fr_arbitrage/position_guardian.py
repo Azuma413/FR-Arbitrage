@@ -224,8 +224,8 @@ class PositionGuardian:
 
         if self._settings.dry_run:
             if self._virtual_wallet:
-                account_value = self._virtual_wallet.account_value
-                total_margin_used = self._virtual_wallet.total_margin_used
+                account_value = self._virtual_wallet.get_account_value(self._states)
+                total_margin_used = self._virtual_wallet.get_total_margin_used(self._states)
             else:
                 return
         elif self._info:

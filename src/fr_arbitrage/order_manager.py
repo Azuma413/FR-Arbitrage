@@ -226,13 +226,21 @@ class OrderManager:
         await upsert_position(position)
 
         if self._settings.wandb_enabled:
-             wandb.log({
+             log_payload = {
                 "trade/entry": 1,
                 "trade/symbol": coin,
                 "trade/entry_price": entry_price,
                 "trade/size": spot_filled,
                 "trade/notional_usdc": spot_filled * entry_price,
-            })
+            }
+             
+             if self._settings.dry_run and self._virtual_wallet:
+                 log_payload.update({
+                     "trade/account_value": self._virtual_wallet.get_account_value(self._states),
+                     "trade/withdrawable": self._virtual_wallet.get_withdrawable(self._states),
+                 })
+                 
+             wandb.log(log_payload)
 
         logger.info(
             "entry_complete",
@@ -296,11 +304,19 @@ class OrderManager:
             logger.info("exit_complete", coin=coin)
 
             if self._settings.wandb_enabled:
-                wandb.log({
+                log_payload = {
                     "trade/exit": 1,
                     "trade/symbol": coin,
                     "trade/exit_type": "full", # or partial if we tracked that better
-                })
+                }
+
+                if self._settings.dry_run and self._virtual_wallet:
+                     log_payload.update({
+                         "trade/account_value": self._virtual_wallet.get_account_value(self._states),
+                         "trade/withdrawable": self._virtual_wallet.get_withdrawable(self._states),
+                     })
+
+                wandb.log(log_payload)
 
             return True
 
@@ -529,7 +545,8 @@ class OrderManager:
                  side="buy" if is_buy else "sell",
                  sz=sz,
                  px=fill_price,
-                 fee=fee
+                 fee=fee,
+                 market_states=self._states
              )
 
         logger.info(
@@ -544,7 +561,7 @@ class OrderManager:
             notional=round(notional, 2),
             fee=round(fee, 4),
             order_id=str(uuid.uuid4())[:8],
-            wallet_balance=self._virtual_wallet.balance if self._virtual_wallet else "N/A"
+            wallet_balance = self._virtual_wallet.balance if self._virtual_wallet else "N/A"
         )
 
         return {"filled_sz": sz, "avg_price": fill_price}

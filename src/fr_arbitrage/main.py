@@ -136,9 +136,9 @@ async def _monitor_funds(
                 if market_states:
                      virtual_wallet.apply_funding(market_states)
 
-                account_value = virtual_wallet.account_value
-                total_margin_used = virtual_wallet.total_margin_used
-                withdrawable = virtual_wallet.withdrawable
+                account_value = virtual_wallet.get_account_value(market_states or {})
+                total_margin_used = virtual_wallet.get_total_margin_used(market_states or {})
+                withdrawable = virtual_wallet.get_withdrawable(market_states or {})
             else:
                 # Live: query exchange
                 user_state = info.user_state(settings.account_address)

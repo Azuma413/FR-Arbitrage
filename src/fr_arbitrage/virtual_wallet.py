@@ -36,28 +36,48 @@ class VirtualWallet:
         
         logger.info("virtual_wallet_initialized", balance=initial_balance)
 
-    @property
-    def account_value(self) -> float:
+    def get_account_value(self, market_states: Dict[str, MarketState]) -> float:
         """Total equity = Balance + Unrealized PnL."""
         upnl = 0.0
-        for pos in self._positions.values():
-            pass
-        return self.balance
+        for key, pos in self._positions.items():
+            # Get current price from market state
+            # Symbol key format: "COIN-spot" or "COIN-perp"
+            coin = pos.symbol.split("-")[0]
+            state = market_states.get(coin)
+            if not state:
+                continue
 
-    @property
-    def total_margin_used(self) -> float:
+            # Use mid_price for valuation
+            current_price = state.mid_price
+            if current_price <= 0:
+                current_price = pos.entry_price
+
+            # PnL = Size * (Current Price - Entry Price)
+            # Works for both Long (Size>0) and Short (Size<0)
+            pnl = pos.size * (current_price - pos.entry_price)
+            upnl += pnl
+
+        return self.balance + upnl
+
+    def get_total_margin_used(self, market_states: Dict[str, MarketState]) -> float:
         """Approximate margin used by open positions."""
         # In cross margin, this is sum of position values * maintenance margin
         # roughly.
         used = 0.0
-        for pos in self._positions.values():
-             used += (abs(pos.size) * pos.entry_price) * self.margin_maintenance
+        for key, pos in self._positions.items():
+             coin = pos.symbol.split("-")[0]
+             state = market_states.get(coin)
+             price = state.mid_price if state else pos.entry_price
+             if price <= 0: price = pos.entry_price
+             
+             used += (abs(pos.size) * price) * self.margin_maintenance
         return used
 
-    @property
-    def withdrawable(self) -> float:
+    def get_withdrawable(self, market_states: Dict[str, MarketState]) -> float:
         """Free collateral."""
-        return max(0.0, self.account_value - self.total_margin_used)
+        equity = self.get_account_value(market_states)
+        margin = self.get_total_margin_used(market_states)
+        return max(0.0, equity - margin)
 
     def update_on_fill(
         self,
@@ -66,7 +86,8 @@ class VirtualWallet:
         side: str,   # "buy" or "sell"
         sz: float,
         px: float,
-        fee: float
+        fee: float,
+        market_states: Dict[str, MarketState] = None
     ) -> None:
         """Update wallet state based on a filled order."""
         
@@ -119,10 +140,14 @@ class VirtualWallet:
             
         pos.size = new_size
         
+        margin_used = 0.0
+        if market_states:
+             margin_used = self.get_total_margin_used(market_states)
+
         logger.info(
             "virtual_wallet_updated",
             balance=round(self.balance, 4),
-            margin_used=round(self.total_margin_used, 4),
+            margin_used=round(margin_used, 4),
             fee=fee,
             coin=coin,
             market=market
