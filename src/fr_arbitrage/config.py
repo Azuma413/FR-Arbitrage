@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     leverage_buffer: float = 0.55  # Perp collateral ratio (55% to perp)
 
     # --- Dry-Run Mode -------------------------------------------------------
-    dry_run: bool = False  # Paper trading: Mainnet data, simulated fills
+    dry_run: bool = True  # Paper trading: Mainnet data, simulated fills
     dry_run_initial_balance: float = 1000.0  # Initial fake USDC for Dry-Run
 
     # --- Position Guardian --------------------------------------------------
@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     def _enable_wandb_if_key_present(self) -> Settings:
 
         if self.wandb_api_key and not self.wandb_enabled:
-             self.wandb_enabled = True
+            self.wandb_enabled = True
         return self
 
     # --- Scan / Guardian intervals (seconds) --------------------------------

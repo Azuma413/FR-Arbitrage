@@ -1,8 +1,0 @@
-hyperliquid-python-sdk>=0.9
-aiohttp>=3.9
-pydantic>=2.0
-pydantic-settings>=2.0
-structlog>=24.0
-sqlalchemy>=2.0
-aiosqlite>=0.19
-wandb>=0.25.0
