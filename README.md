@@ -22,11 +22,6 @@ Hyperliquid上のSpot（現物）とPerpetual（無期限先物）の間で、�
 * `structlog`: 構造化ログ（JSON形式）による可観測性の向上。
 
 
-* **インフラ:**
-* Docker Compose（Bot + SQLite volume）。
-* VPS: AWS Tokyo/Singapore または Vultr Tokyo（Hyperliquidのエンドポイントに近いリージョン）。
-
-
 
 ## 3. システムアーキテクチャ
 

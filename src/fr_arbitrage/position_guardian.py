@@ -43,8 +43,6 @@ class PositionGuardian:
         self._virtual_wallet = virtual_wallet
         self._info: Optional[Info] = None
 
-        # Track consecutive negative FR counts per coin
-        self._negative_fr_counts: Dict[str, int] = {}
         self._stop_event = asyncio.Event()
         self._running = False
 
@@ -102,38 +100,32 @@ class PositionGuardian:
             if state is None:
                 continue
 
-            # --- Exit condition 1: Negative FR for N consecutive checks ---
-            if state.funding_rate < 0:
-                count = self._negative_fr_counts.get(coin, 0) + 1
-                self._negative_fr_counts[coin] = count
+            # --- Exit condition 1: Negative FR Moving Average ---
+            if state.ma_funding_rate < 0:
                 logger.warning(
-                    "negative_fr_detected",
+                    "negative_fr_ma_detected",
                     coin=coin,
-                    funding_rate=f"{state.funding_rate:.6%}",
-                    consecutive_count=count,
+                    current_fr=f"{state.funding_rate:.6%}",
+                    ma_fr=f"{state.ma_funding_rate:.6%}",
+                    history_points=len(state.funding_rate_history),
                 )
-                if count >= self._settings.exit_negative_fr_count:
-                    logger.warning(
-                        "exit_trigger_negative_fr",
-                        coin=coin,
-                        consecutive=count,
-                    )
+                logger.warning(
+                    "exit_trigger_negative_fr_ma",
+                    coin=coin,
+                    ma_fr=f"{state.ma_funding_rate:.6%}",
+                )
 
-                    if self._settings.wandb_enabled:
-                        wandb.log({
-                            "guardian/trigger_exit_negative_fr": 1, 
-                            "guardian/symbol": coin,
-                            "guardian/consecutive_negative_fr": count
-                        })
-                    await self._close_position(position)
-                    continue
-
-            else:
-                # Reset counter when FR is positive
-                self._negative_fr_counts[coin] = 0
+                if self._settings.wandb_enabled:
+                    wandb.log({
+                        "guardian/trigger_exit_negative_fr_ma": 1, 
+                        "guardian/symbol": coin,
+                        "guardian/ma_fr": state.ma_funding_rate
+                    })
+                await self._close_position(position)
+                continue
 
             # --- Exit condition 2: Spread backwardation (profit-take) ---
-            if state.perp_spot_spread < 0 and abs(state.perp_spot_spread) > 0.005:
+            if state.perp_spot_spread > 0 and state.perp_spot_spread > 0.005:
                 logger.info(
                     "exit_trigger_backwardation",
                     coin=coin,

@@ -144,7 +144,20 @@ class MarketDataStreamer:
                     coin_name = asset_info.get("name", "")
                     if coin_name in self.states:
                         state = self.states[coin_name]
-                        state.funding_rate = float(ctx.get("funding", 0))
+                        
+                        fr_value = float(ctx.get("funding", 0))
+                        state.funding_rate = fr_value
+                        
+                        # Add to history and prune
+                        now = time.time()
+                        state.funding_rate_history.append((now, fr_value))
+                        
+                        cutoff_time = now - (self._settings.fr_ma_window_hours * 3600)
+                        state.funding_rate_history = [
+                            entry for entry in state.funding_rate_history 
+                            if entry[0] >= cutoff_time
+                        ]
+                        
                         state.open_interest = float(ctx.get("openInterest", 0))
                         mid = float(ctx.get("midPx", 0))
                         if mid > 0:

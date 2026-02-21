@@ -4,3 +4,4 @@ __pycache__
 *.db
 wandb
 .vscode
+*.egg-info

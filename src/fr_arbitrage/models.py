@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List, Tuple
 
 from pydantic import BaseModel
 from sqlalchemy import Column, DateTime, Float, String, func
@@ -94,6 +94,16 @@ class MarketState:
     spot_best_ask: float = 0.0
     spot_mid_price: float = 0.0
     last_updated: float = 0.0  # Unix timestamp
+    funding_rate_history: List[Tuple[float, float]] = field(default_factory=list)  # [(timestamp, FR)]
+
+    @property
+    def ma_funding_rate(self) -> float:
+        """Moving average of the funding rate over the tracked history."""
+        if not self.funding_rate_history:
+            return self.funding_rate
+        # Calculate simple average of the historical rates
+        total = sum(fr for _, fr in self.funding_rate_history)
+        return total / len(self.funding_rate_history)
 
     @property
     def perp_spot_spread(self) -> float:
